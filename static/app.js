@@ -72,15 +72,40 @@ function updateShareSheetUI() {
   updateSharingLinkDisplay();
 }
 
-function triggerSharePdfDownload() {
-  if (!requireShareFileOrAlert()) return;
-  const name = getDownloadFilenameForFileId(shareContextFile.id);
+/** Mobile browsers often block programmatic <a download> clicks (especially after await). Full navigation to GET /download/… is reliable. */
+function isMobileDownloadEnvironment() {
+  const coarse =
+    typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
+  const ua = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+  return coarse || ua;
+}
+
+/**
+ * @param {string} fileId
+ * @param {string} filename suggested filename (query + download attr)
+ * @returns {boolean} true if the page is navigating away (mobile path)
+ */
+function downloadPdfByFileId(fileId, filename) {
+  const u = new URL(`${window.location.origin}/download/${fileId}`);
+  u.searchParams.set("filename", filename);
+  const url = u.toString();
+  if (isMobileDownloadEnvironment()) {
+    window.location.assign(url);
+    return true;
+  }
   const link = document.createElement("a");
-  link.href = `/download/${shareContextFile.id}?filename=${encodeURIComponent(name)}`;
-  link.download = name;
+  link.href = url;
+  link.download = filename;
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+  return false;
+}
+
+function triggerSharePdfDownload() {
+  if (!requireShareFileOrAlert()) return;
+  const name = getDownloadFilenameForFileId(shareContextFile.id);
+  downloadPdfByFileId(shareContextFile.id, name);
 }
 
 function wireShareSheetActions() {
@@ -161,13 +186,10 @@ function wireShareSheetActions() {
       }
       renderMockFiles();
       const name = getDownloadFilenameForFileId(json.file_id);
-      const link = document.createElement("a");
-      link.href = `/download/${json.file_id}?filename=${encodeURIComponent(name)}`;
-      link.download = name;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      showCustomAlert("Success", "Compressed PDF downloaded.", true);
+      const navigatedAway = downloadPdfByFileId(json.file_id, name);
+      if (!navigatedAway) {
+        showCustomAlert("Success", "Compressed PDF downloaded.", true);
+      }
     } catch (err) {
       showCustomAlert("Failed", err.message || String(err), false);
     } finally {
@@ -261,6 +283,68 @@ function persistRecentFiles() {
   } catch {
     /* quota / private mode */
   }
+}
+
+async function executeDeleteFile(file) {
+  moreOptionsSheetOverlay?.classList.add("hidden");
+  loadingOverlay.classList.remove("hidden");
+  uploadStatus.textContent = "Deleting file...";
+  try {
+    const res = await fetch(`${window.location.origin}/file/${encodeURIComponent(file.id)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok && res.status !== 404) {
+      let msg = "Delete failed.";
+      try {
+        const j = await res.json();
+        if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(msg);
+    }
+  } catch (e) {
+    showCustomAlert("Failed", e.message || String(e), false);
+    loadingOverlay.classList.add("hidden");
+    return;
+  }
+  loadingOverlay.classList.add("hidden");
+
+  if (currentFileId === file.id) {
+    currentFileId = null;
+    pageEditor.innerHTML = "";
+    textAreas = [];
+    pagesMeta = [];
+    originalItems = [];
+    editorHistory = [];
+    editorHistoryIndex = -1;
+    editorView.classList.remove("active");
+    homeView.classList.add("active");
+  }
+
+  const ix = mockFiles.findIndex((f) => f.id === file.id);
+  if (ix > -1) mockFiles.splice(ix, 1);
+  if (shareContextFile && shareContextFile.id === file.id) shareContextFile = null;
+  if (selectedMoreFile && selectedMoreFile.fileObj && selectedMoreFile.fileObj.id === file.id) {
+    selectedMoreFile = null;
+  }
+  persistRecentFiles();
+  renderMockFiles();
+  showCustomAlert("Deleted", "File removed.", true);
+}
+
+function confirmAndDeleteFile(file) {
+  if (!file || !file.id) {
+    showCustomAlert("Demo file", "Upload a real PDF first, then you can delete it from the list.", false);
+    return;
+  }
+  showCustomConfirm(
+    "Delete file?",
+    `Remove "${file.title}" from this list and delete its copy on the server? This cannot be undone.`,
+    () => {
+      void executeDeleteFile(file);
+    }
+  );
 }
 
 let mockFiles = [...loadRecentFilesFromStorage()];
@@ -456,8 +540,8 @@ function renderMockFiles() {
               <button class="action-row-btn edit-file-btn" aria-label="Edit text">
                  <i class="fa-solid fa-pen-to-square"></i> <span>Edit text</span> <i class="fa-solid fa-star blue-star" style="font-size:10px; color:#0070d6; margin-left:4px;"></i>
               </button>
-              <button class="action-row-btn" aria-label="Fill & Sign">
-                 <i class="fa-solid fa-signature"></i> <span>Fill & Sign</span>
+              <button type="button" class="action-row-btn" aria-label="Delete file">
+                 <i class="fa-solid fa-trash-can"></i> <span>Delete</span>
               </button>
               <button class="action-row-btn" aria-label="More Options">
                  <i class="fa-solid fa-ellipsis-vertical"></i> <span>More</span>
@@ -486,8 +570,8 @@ function renderMockFiles() {
                    <i class="fa-solid fa-star" style="position:absolute; top:-2px; right:-6px; font-size:8px; color:#0070d6;"></i>
                  </i>
               </button>
-              <button class="action-icon-btn" aria-label="Comment">
-                 <i class="fa-regular fa-comment-dots"></i>
+              <button type="button" class="action-icon-btn" aria-label="Delete file">
+                 <i class="fa-solid fa-trash-can"></i>
               </button>
               <button class="action-icon-btn" aria-label="More Options">
                  <i class="fa-solid fa-ellipsis-vertical"></i>
@@ -501,6 +585,7 @@ function renderMockFiles() {
     // Add logic to "edit", "share", and "more" buttons
     const editBtn = card.querySelector('.edit-file-btn');
     const shareBtn = card.querySelector('[aria-label="Share"]');
+    const deleteBtn = card.querySelector('[aria-label="Delete file"]');
     const moreBtn = card.querySelector('[aria-label="More Options"]');
     const shareSheetOverlay = document.getElementById("shareSheetOverlay");
     const moreOptionsSheetOverlay = document.getElementById("moreOptionsSheetOverlay");
@@ -559,7 +644,35 @@ function renderMockFiles() {
 
     editBtn?.addEventListener('click', openEditor);
     shareBtn?.addEventListener('click', openShare);
+    deleteBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      confirmAndDeleteFile(file);
+    });
     moreBtn?.addEventListener('click', openMoreOptions);
+
+    const thumbEl = card.querySelector(".fc-thumb");
+    const titleEl = card.querySelector(".fc-title");
+    const openEditorFromThumbOrTitle = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openEditor();
+    };
+    thumbEl?.addEventListener("click", openEditorFromThumbOrTitle);
+    titleEl?.addEventListener("click", openEditorFromThumbOrTitle);
+    thumbEl?.setAttribute("role", "button");
+    thumbEl?.setAttribute("tabindex", "0");
+    thumbEl?.setAttribute("aria-label", "Open PDF");
+    titleEl?.setAttribute("role", "button");
+    titleEl?.setAttribute("tabindex", "0");
+    titleEl?.setAttribute("aria-label", "Open PDF");
+    const keyOpen = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openEditor();
+      }
+    };
+    thumbEl?.addEventListener("keydown", keyOpen);
+    titleEl?.addEventListener("keydown", keyOpen);
 
     recentFilesList.appendChild(card);
   });
@@ -679,6 +792,11 @@ document.getElementById("compressPdfBtn")?.addEventListener('click', async () =>
     } else {
         await performCompression();
     }
+});
+
+document.getElementById("deleteFileMoreBtn")?.addEventListener("click", () => {
+  if (!selectedMoreFile || !selectedMoreFile.fileObj) return;
+  confirmAndDeleteFile(selectedMoreFile.fileObj);
 });
 
 shareSheetOverlay?.addEventListener('click', (e) => {

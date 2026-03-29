@@ -57,6 +57,14 @@ body {
 .file-card { background: #fff; margin: 8px 16px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; flex-direction: column; overflow: hidden; padding: 12px;}
 .fc-container { display: flex; gap: 16px; }
 .fc-thumb { width: 140px; height: 180px; background-color: #fff; border: 1px solid #e0e0e0; flex-shrink: 0; background-size: contain; background-repeat: no-repeat; background-position: top center; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);}
+.file-card .fc-thumb,
+.file-card .fc-title {
+  cursor: pointer;
+}
+.file-card .fc-thumb:active,
+.file-card .fc-title:active {
+  opacity: 0.92;
+}
 .fc-content { flex: 1; display: flex; flex-direction: column; }
 .fc-header { margin-bottom: 24px; }
 .fc-title { font-size: 15px; font-weight: 500; color: #333; margin-bottom: 4px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.3; }
@@ -278,7 +286,7 @@ body {
 .share-divider { height: 1px; background: #f0f0f0; margin: 16px 0; }
 
 .share-pdf-options { display: flex; flex-direction: column; gap: 12px; }
-.share-pdf-btn { display: flex; align-items: center; width: 100%; padding: 14px 16px; border: 0.5px solid #ddd; background: #fff; border-radius: 4px; gap: 12px; cursor: pointer; position: relative;}
+.share-pdf-btn { display: flex; align-items: center; width: 100%; padding: 14px 16px; border: 0.5px solid #ddd; background: #fff; border-radius: 4px; gap: 12px; cursor: pointer; position: relative; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 .share-pdf-btn i { font-size: 18px; color: #555; }
 .share-pdf-btn span { font-size: 15px; color: #333; font-weight: 400; }
 .premium-star { position: absolute; font-size: 10px !important; color: #0070d6 !important; bottom: 8px; right: 12px; }
@@ -308,6 +316,9 @@ body {
 .more-options-list { display: flex; flex-direction: column; }
 .more-option-btn { background: none; border: none; width: 100%; display: flex; align-items: center; padding: 16px 20px; font-size: 16px; font-weight: 400; color: #333; cursor: pointer; text-align: left; }
 .more-option-btn:active { background: #f0f0f0; }
+.more-option-btn.more-option-danger { color: #c62828; }
+.more-option-btn.more-option-danger .more-option-icon { color: #c62828; }
+.more-option-btn.more-option-danger:active { background: #ffebee; }
 .more-option-icon { width: 40px; display: flex; justify-content: flex-start; color: #555; font-size: 18px; }
 .more-option-text { flex: 1; }
 .premium-star-inline { font-size: 10px; color: #0070d6; margin-left: 8px;}

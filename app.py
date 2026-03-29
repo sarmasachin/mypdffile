@@ -9,6 +9,7 @@ from typing import Any
 import zipfile
 import io
 import os
+import re
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
@@ -738,6 +739,22 @@ async def download_pdf(file_id: str, filename: str | None = None) -> FileRespons
         raise HTTPException(status_code=404, detail="Edited PDF not found")
     fname = _safe_download_filename(filename)
     return FileResponse(path=path, filename=fname, media_type="application/pdf")
+
+
+@app.delete("/file/{file_id}")
+async def delete_file_workspace(file_id: str) -> dict[str, Any]:
+    """Remove the server-side workspace folder for this upload (PDFs, previews, stamps)."""
+    if not re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        file_id,
+    ):
+        raise HTTPException(status_code=400, detail="Invalid file id")
+    d = (WORK_DIR / file_id).resolve()
+    if WORK_DIR.resolve() != d.parent:
+        raise HTTPException(status_code=400, detail="Invalid file id")
+    if d.is_dir():
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": True}
 
 
 def _pdf_to_image_zip_bytes(file_id: str, kind: str) -> tuple[bytes, str, str]:
