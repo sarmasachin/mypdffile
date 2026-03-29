@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 from starlette.requests import Request
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,7 +25,8 @@ STAMP_DIR = WORK_DIR / "stamps"
 STAMP_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="PDF Editor Tool")
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+# Behind Render / other reverse proxies so request.url_for / schemes stay correct.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
@@ -1365,3 +1367,12 @@ async def sign_pkcs12(
     new_id, out_path = _new_work_file_id()
     out_path.write_bytes(signed)
     return {"file_id": new_id, "size": out_path.stat().st_size, "status": "success"}
+
+
+# Mount static files last so /static/* is never shadowed by route registration quirks on Linux hosts.
+_static_root = BASE_DIR / "static"
+app.mount(
+    "/static",
+    StaticFiles(directory=str(_static_root), check_dir=True),
+    name="static",
+)
