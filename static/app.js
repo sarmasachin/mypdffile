@@ -225,13 +225,6 @@ function wireShareSheetActions() {
 }
 
 const RECENT_FILES_KEY = "pdfEditorRecentFiles_v1";
-const DEMO_FILES = [
-  { title: "Adobe Scan 20 Mar 2026", date: "20/03/26", thumb: "" },
-  { title: "Adobe Scan 05 Feb 20... (2)_recovered", date: "20/03/26", thumb: "" },
-  { title: "Adobe Scan 05 Feb 2026 (2)", date: "20/03/26", thumb: "" },
-  { title: "Manisha Tempta", date: "12/03/26", thumb: "" },
-  { title: "GST Certificate-1", date: "09/02/26", thumb: "" },
-];
 
 function loadRecentFilesFromStorage() {
   try {
@@ -270,7 +263,7 @@ function persistRecentFiles() {
   }
 }
 
-let mockFiles = [...loadRecentFilesFromStorage(), ...DEMO_FILES];
+let mockFiles = [...loadRecentFilesFromStorage()];
 
 const MAX_EDITOR_HISTORY = 50;
 let editorHistory = [];
@@ -435,6 +428,12 @@ document.querySelector(".editor-toolbar")?.addEventListener("click", () => {
 
 function renderMockFiles() {
   recentFilesList.innerHTML = "";
+  if (mockFiles.length === 0) {
+    recentFilesList.innerHTML =
+      '<p class="file-list-empty-hint" style="text-align:center;padding:32px 20px;color:#666;font-size:15px;line-height:1.5;">No PDFs yet. Tap <strong style="color:#0070d6;">+</strong> below to upload.</p>';
+    persistRecentFiles();
+    return;
+  }
   mockFiles.forEach((file, index) => {
     const card = document.createElement("div");
     card.className = "file-card";
@@ -1716,6 +1715,13 @@ async function renderEditor(pages, items) {
       
       // Since it runs once initially without scale, stageRect is accurate unscaled size
       const pxPerPoint = stageRect.height / page.height;
+
+      function pxPerPointLive() {
+        const m = stage.style.transform.match(/scale\(([^)]+)\)/);
+        const sc = m ? parseFloat(m[1]) : 1;
+        const sr = stage.getBoundingClientRect();
+        return (sr.height / sc) / page.height;
+      }
       
       for (const obj of boxWrappers) {
         const area = obj.area;
@@ -1753,7 +1759,8 @@ async function renderEditor(pages, items) {
            const currentH = parseFloat(box.style.height);
            if (area.scrollHeight > currentH) {
                box.style.height = `${area.scrollHeight}px`;
-               const ptY1 = Number(area.dataset.y0) + (area.scrollHeight / pxPerPoint);
+               const ppp = pxPerPointLive();
+               const ptY1 = Number(area.dataset.y0) + (area.scrollHeight / ppp);
                area.dataset.bbox = JSON.stringify([Number(area.dataset.x0), Number(area.dataset.y0), Number(area.dataset.x1), ptY1]);
                area.dataset.y1 = ptY1;
            }
@@ -2101,9 +2108,70 @@ async function renderEditor(pages, items) {
   homeView.classList.add('active');
 });
 
+/** Reset mobile zoom so layout offsets match PDF math; must run before reading bboxes for save. */
+function normalizeEditorLayoutForSave() {
+  document.querySelectorAll(".page-stage").forEach((stage) => {
+    stage.style.transform = "scale(1)";
+    stage.style.transformOrigin = "0 0";
+    stage.style.width = "100%";
+    stage.style.height = "auto";
+    const pw = stage.closest(".page-wrapper");
+    if (pw) {
+      pw.style.width = "100%";
+      pw.style.height = "auto";
+      pw.style.zIndex = "1";
+    }
+  });
+  document.querySelectorAll(".pdf-box-wrapper").forEach((w) => w.classList.remove("active"));
+  const ae = document.activeElement;
+  if (ae && ae.classList && ae.classList.contains("pdf-text-input")) {
+    ae.blur();
+  }
+}
+
+/** Recompute dataset bbox from box positions (PDF points) after zoom is 1 — fixes mobile edit drift. */
+function syncBboxesFromDOMToPdfPoints() {
+  const pagesByNum = new Map(pagesMeta.map((p) => [p.page, p]));
+  document.querySelectorAll(".page-wrapper").forEach((pageWrapper) => {
+    const stage = pageWrapper.querySelector(".page-stage");
+    const overlay = pageWrapper.querySelector(".overlay");
+    if (!stage || !overlay) return;
+    const pageNum = parseInt(overlay.dataset.page || "1", 10);
+    const pageMeta = pagesByNum.get(pageNum);
+    if (!pageMeta) return;
+    const ph = pageMeta.height;
+    const stageH = stage.offsetHeight;
+    if (!stageH) return;
+    const pxPerPoint = stageH / ph;
+    overlay.querySelectorAll(".pdf-text-input").forEach((area) => {
+      const box = area.closest(".pdf-box-wrapper");
+      if (!box) return;
+      const newL = box.offsetLeft;
+      const newT = box.offsetTop;
+      const newW = box.offsetWidth;
+      const newH = box.offsetHeight;
+      const ptX0 = newL / pxPerPoint;
+      const ptY0 = newT / pxPerPoint;
+      const ptX1 = (newL + newW) / pxPerPoint;
+      const ptY1 = (newT + newH) / pxPerPoint;
+      area.dataset.bbox = JSON.stringify([ptX0, ptY0, ptX1, ptY1]);
+      area.dataset.x0 = String(ptX0);
+      area.dataset.y0 = String(ptY0);
+      area.dataset.x1 = String(ptX1);
+      area.dataset.y1 = String(ptY1);
+    });
+  });
+}
+
 // Save changes to backend
 saveBtn.addEventListener("click", async () => {
   if (!currentFileId) return;
+
+  normalizeEditorLayoutForSave();
+  await new Promise((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(resolve))
+  );
+  syncBboxesFromDOMToPdfPoints();
 
   const normalize = (s) => String(s || "").replace(/\r\n/g, "\n");
 

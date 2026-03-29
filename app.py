@@ -166,7 +166,13 @@ def _add_diagonal_watermark(page: fitz.Page, text: str, opacity: float) -> None:
     color = (gray, gray, gray)
     tw = fitz.TextWriter(r)
     tw.append(c, text, fontsize=44)
-    tw.write_text(page, color=color, morph=(c, fitz.Matrix(1.15, 1.15).prerotate(45)))
+    # overlay=0 draws in the background (under page content); overlay=1 would sit on top.
+    tw.write_text(
+        page,
+        color=color,
+        morph=(c, fitz.Matrix(1.15, 1.15).prerotate(45)),
+        overlay=0,
+    )
 
 
 def _insert_textbox_fit(

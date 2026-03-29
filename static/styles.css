@@ -1,10 +1,24 @@
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-body { font-family: 'Roboto', sans-serif; background-color: #f2f2f2; color: #333; overflow-x: hidden; }
+html {
+  height: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  font-family: 'Roboto', sans-serif;
+  background-color: #f2f2f2;
+  color: #333;
+  overflow-x: hidden;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
 
 /* Constrain view to look like a mobile app even on desktop */
 .view { 
   display: none; 
-  height: 100vh; 
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100vh;
+  max-height: 100dvh;
   width: 100%; 
   max-width: 500px; 
   margin: 0 auto; 
@@ -13,6 +27,7 @@ body { font-family: 'Roboto', sans-serif; background-color: #f2f2f2; color: #333
   flex-direction: column; 
   box-shadow: 0 0 10px rgba(0,0,0,0.1); 
   overflow: hidden;
+  min-height: 0;
 }
 .view.active { display: flex; }
 
@@ -29,8 +44,16 @@ body { font-family: 'Roboto', sans-serif; background-color: #f2f2f2; color: #333
 .promo-btn { background: transparent; border: 1.5px solid #fff; color: #fff; padding: 6px 14px; border-radius: 20px; font-weight: 500; font-size: 13px; cursor: pointer; transition: background 0.2s;}
 .promo-btn:active { background: rgba(255,255,255,0.2); }
 
-/* File List (Recent Items) */
-.file-list { flex: 1; overflow-y: auto; padding-bottom: 80px; background: #f2f2f2; padding-top: 8px;}
+/* File List (Recent Items) — extra bottom padding for fixed bottom nav + home indicator */
+.file-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: calc(80px + env(safe-area-inset-bottom, 0px));
+  background: #f2f2f2;
+  padding-top: 8px;
+}
 .file-card { background: #fff; margin: 8px 16px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; flex-direction: column; overflow: hidden; padding: 12px;}
 .fc-container { display: flex; gap: 16px; }
 .fc-thumb { width: 140px; height: 180px; background-color: #fff; border: 1px solid #e0e0e0; flex-shrink: 0; background-size: contain; background-repeat: no-repeat; background-position: top center; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);}
@@ -54,8 +77,23 @@ body { font-family: 'Roboto', sans-serif; background-color: #f2f2f2; color: #333
 .action-icon-btn { background: none; border: none; font-size: 21px; color: #555; cursor: pointer; padding: 6px; display: flex; align-items: center; justify-content: center; }
 .action-icon-btn:active { opacity: 0.7; }
 
-/* Bottom Nav */
-.bottom-nav { position: absolute; bottom: 0; width: 100%; height: 64px; background: #fff; display: flex; box-shadow: 0 -2px 5px rgba(0,0,0,0.05); z-index: 10; border-top: 1px solid #ddd;}
+/* Bottom Nav — fixed to viewport so it stays put on mobile scroll / URL bar resize */
+.bottom-nav {
+  position: fixed;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100%;
+  max-width: 500px;
+  min-height: 64px;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  box-sizing: border-box;
+  background: #fff;
+  display: flex;
+  box-shadow: 0 -2px 5px rgba(0, 0, 0, 0.05);
+  z-index: 100;
+  border-top: 1px solid #ddd;
+}
 .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #777; text-decoration: none; font-size: 12px; font-weight: 500; position: relative;}
 .nav-item.active { color: #0070d6; }
 .nav-item i { font-size: 22px; margin-bottom: 4px; }
@@ -70,7 +108,15 @@ body { font-family: 'Roboto', sans-serif; background-color: #f2f2f2; color: #333
 .editor-header-left { display: flex; align-items: center; gap: 12px; }
 .editor-header-right { display: flex; align-items: center; }
 .editor-title { font-size: 18px; font-weight: 400; color: #222;}
-.editor-workspace { flex: 1; background: #d0d0d0; overflow-y: auto; padding: 16px; position: relative; }
+.editor-workspace {
+  flex: 1;
+  min-height: 0;
+  background: #d0d0d0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 16px;
+  position: relative;
+}
 .page-wrapper { margin-bottom: 24px; background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.2); position: relative; }
 .page-stage { position: relative; width: 100%; overflow: hidden; transition: transform 0.3s ease-in-out, transform-origin 0.3s ease-in-out; }
 .page-image { width: 100%; height: auto; display: block; }
@@ -152,7 +198,51 @@ body { font-family: 'Roboto', sans-serif; background-color: #f2f2f2; color: #333
 .pdf-box-wrapper.active .move-handle { display: flex; }
 .move-handle i { font-size: 11px; }
 
-.editor-bottom-wrap { border-top: 1px solid #ddd; background: #fff; display: flex; flex-direction: column; flex-shrink: 0;}
+.editor-bottom-wrap {
+  border-top: 1px solid #ddd;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+/* Preview after save: scroll only the page strip; keep Download pinned */
+#preview-view {
+  min-height: 0;
+}
+#preview-view .preview-scroll-area {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 16px;
+  background: #e0e0e0;
+  display: flex;
+  flex-direction: column;
+}
+#preview-view .preview-download-bar {
+  flex-shrink: 0;
+  padding: 12px 16px;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  background: #fff;
+  border-top: 1px solid #e0e0e0;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.06);
+}
+#preview-view .btn-download-pdf {
+  width: 100%;
+  background: #0070d6;
+  color: #fff;
+  border: none;
+  padding: 14px;
+  border-radius: 24px;
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+}
+#preview-view .btn-download-pdf:active {
+  opacity: 0.92;
+}
 .editor-promo { padding: 10px 16px; }
 .editor-toolbar { height: 54px; display: flex; justify-content: space-between; align-items: center; padding: 0 8px; overflow-x: auto; background: #fafafa;}
 .editor-toolbar::-webkit-scrollbar { display: none; }
