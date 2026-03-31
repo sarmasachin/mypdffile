@@ -8,6 +8,7 @@ from typing import Any
 
 import zipfile
 import io
+import math
 import os
 import re
 import fitz  # PyMuPDF
@@ -15,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -24,6 +25,18 @@ WORK_DIR = BASE_DIR / "work"
 WORK_DIR.mkdir(exist_ok=True)
 STAMP_DIR = WORK_DIR / "stamps"
 STAMP_DIR.mkdir(exist_ok=True)
+# Saved beside each watermarked export so /remove_watermark can restore the PDF before watermark.
+NO_WM_BACKUP_NAME = "_no_wm.pdf"
+
+
+def _carry_no_wm_backup_if_present(src_file_id: str, dest_dir: Path) -> None:
+    """Keep remove-watermark working after compress/reorder/etc. create a new workspace id."""
+    if not src_file_id:
+        return
+    src = WORK_DIR / src_file_id / NO_WM_BACKUP_NAME
+    if src.is_file():
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest_dir / NO_WM_BACKUP_NAME)
 
 app = FastAPI(title="PDF Editor Tool")
 # Behind Render / other reverse proxies so request.url_for / schemes stay correct.
@@ -92,10 +105,19 @@ class CropNormRequest(BaseModel):
     all_pages: bool = False
 
 
+class RemoveWatermarkRequest(BaseModel):
+    file_id: str
+
+
 class WatermarkRequest(BaseModel):
     file_id: str
     text: str = "Draft"
-    opacity: float = 0.25
+    opacity: float = Field(0.25, ge=0.05, le=0.95)
+    font_size: float = Field(48.0, ge=8.0, le=200.0, description="Font size in PDF points")
+    position: str = Field(
+        "center",
+        description="e.g. center, diagonal, top_left, top_center, bottom_right, …",
+    )
 
 
 class MetadataUpdateRequest(BaseModel):
@@ -136,6 +158,40 @@ def preview_edited_path(file_id: str, page_number: int) -> Path:
     return WORK_DIR / file_id / f"preview_edited-{page_number}.png"
 
 
+def _preview_png_stale(png: Path, pdf: Path) -> bool:
+    """True if png is missing or older than the PDF (need to re-render)."""
+    try:
+        if not pdf.is_file():
+            return True
+        if not png.is_file():
+            return True
+        return pdf.stat().st_mtime > png.stat().st_mtime
+    except OSError:
+        return True
+
+
+def fitz_open_workspace_pdf(path: str | Path) -> fitz.Document:
+    """Open a workspace PDF. Passwords are not read from disk; use unlock flow for encrypted files."""
+    return fitz.open(path)
+
+
+def _safe_fitz_close(doc: fitz.Document | None) -> None:
+    """Avoid ValueError('document closed or encrypted') from double-close after some save() paths."""
+    if doc is None:
+        return
+    try:
+        if getattr(doc, "is_closed", False):
+            return
+        doc.close()
+    except Exception:
+        pass
+
+
+def _workspace_user_password_path(file_id: str) -> Path:
+    """Deprecated: do not persist passwords on disk."""
+    return WORK_DIR / file_id / ".pdf_user_pw"
+
+
 def ensure_file(file_id: str) -> Path:
     path = input_path(file_id)
     if not path.exists():
@@ -160,19 +216,237 @@ def _new_work_file_id() -> tuple[str, Path]:
     return new_id, out_dir / "input.pdf"
 
 
-def _add_diagonal_watermark(page: fitz.Page, text: str, opacity: float) -> None:
+_WATERMARK_POSITIONS = frozenset(
+    {
+        "top_left",
+        "top_center",
+        "top_right",
+        "middle_left",
+        "center",
+        "middle_right",
+        "bottom_left",
+        "bottom_center",
+        "bottom_right",
+        "diagonal",
+        "four_corners",
+        "perimeter",
+    }
+)
+
+
+def _normalize_watermark_position(raw: str) -> str:
+    s = (raw or "center").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "centre": "center",
+        "middle": "center",
+        "mid": "center",
+        "tl": "top_left",
+        "tc": "top_center",
+        "tr": "top_right",
+        "ml": "middle_left",
+        "mr": "middle_right",
+        "bl": "bottom_left",
+        "bc": "bottom_center",
+        "br": "bottom_right",
+        "diag": "diagonal",
+        "border": "perimeter",
+        "frame": "perimeter",
+        "corners": "four_corners",
+        "four_corner": "four_corners",
+        "repeat": "perimeter",
+        "around": "perimeter",
+    }
+    s = aliases.get(s, s)
+    if s not in _WATERMARK_POSITIONS:
+        raise ValueError(
+            "Invalid position. Use one of: top_left, top_center, top_right, middle_left, center, "
+            "middle_right, bottom_left, bottom_center, bottom_right, diagonal, four_corners, perimeter"
+        )
+    return s
+
+
+def _watermark_gray_color(opacity: float) -> tuple[float, float, float]:
+    o = float(min(max(opacity, 0.05), 1.0))
+    gray = max(0.72, min(0.92, 0.78 + (1.0 - o) * 0.12))
+    return (gray, gray, gray)
+
+
+def _add_diagonal_center_watermark(page: fitz.Page, text: str, opacity: float, font_size: float) -> None:
+    """Classic single watermark: centered, tilted along page diagonal (bottom-left → top-right)."""
     r = page.rect
-    c = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
-    gray = max(0.72, min(0.92, 0.78 + (1.0 - min(max(opacity, 0.05), 1.0)) * 0.12))
-    color = (gray, gray, gray)
-    tw = fitz.TextWriter(r)
-    tw.append(c, text, fontsize=44)
-    # overlay=0 draws in the background (under page content); overlay=1 would sit on top.
-    tw.write_text(
-        page,
+    color = _watermark_gray_color(opacity)
+    t = (text or "").strip() or "Draft"
+    fs = float(max(12.0, min(120.0, font_size)))
+    pw, ph = r.width, r.height
+    cx = (r.x0 + r.x1) / 2
+    cy = (r.y0 + r.y1) / 2
+    twidth = fitz.get_text_length(t, fontname="helv", fontsize=fs)
+    origin = fitz.Point(cx - twidth / 2, cy + fs * 0.35)
+    twt = fitz.TextWriter(r)
+    twt.append(origin, t, fontsize=fs)
+    pivot = fitz.Point(cx, cy)
+    scale = max(0.75, min(1.4, fs / 48.0))
+    angle_deg = math.degrees(math.atan2(-ph, pw))
+    mat = fitz.Matrix(scale, scale).prerotate(angle_deg)
+    twt.write_text(page, color=color, morph=(pivot, mat), overlay=0)
+
+
+def _add_subtle_four_corner_watermark(page: fitz.Page, text: str, opacity: float, font_size: float) -> None:
+    """
+    One small label in each corner only (readable but not covering the page body).
+    Font size is capped ~7–11pt; drawn behind page content (overlay=False).
+    """
+    r = page.rect
+    color = _watermark_gray_color(opacity)
+    t = (text or "").strip() or "Draft"
+    fs = max(7.0, min(11.0, float(font_size) * 0.22 + 4.5))
+    tw = fitz.get_text_length(t, fontname="helv", fontsize=fs)
+    pw, ph = r.width, r.height
+    m = min(pw, ph) * 0.022
+    y_top = r.y0 + m + fs * 0.82
+    y_bot = r.y1 - m - fs * 0.12
+    for px, py in (
+        (r.x0 + m, y_top),
+        (r.x1 - m - tw, y_top),
+        (r.x0 + m, y_bot),
+        (r.x1 - m - tw, y_bot),
+    ):
+        page.insert_text(
+            fitz.Point(px, py),
+            t,
+            fontsize=fs,
+            fontname="helv",
+            color=color,
+            overlay=False,
+        )
+
+
+def _add_perimeter_tiled_small(page: fitz.Page, text: str, opacity: float, font_size: float) -> None:
+    """
+    Repeat small text along all four edges (top L→R, right T→B, bottom R→L, left B→T)
+    as many times as fit. Font stays ~7–11pt so the page is not covered like large tiles.
+    """
+    r = page.rect
+    color = _watermark_gray_color(opacity)
+    t = (text or "").strip() or "Draft"
+    fs = max(7.0, min(11.0, float(font_size) * 0.22 + 4.5))
+    tw = fitz.get_text_length(t, fontname="helv", fontsize=fs)
+    pw, ph = r.width, r.height
+    m = min(pw, ph) * 0.03
+    gap = fs * 0.12
+    chunk = tw + gap
+
+    x0, y0, x1, y1 = r.x0 + m, r.y0 + m, r.x1 - m, r.y1 - m
+    step_v = max(fs * 1.02, tw * 0.42)
+
+    y_base = y0 + fs * 0.72
+    x = x0
+    while x + tw <= x1:
+        page.insert_text(
+            fitz.Point(x, y_base),
+            t,
+            fontsize=fs,
+            fontname="helv",
+            color=color,
+            overlay=False,
+        )
+        x += chunk
+
+    x_r = x1 - fs * 0.22
+    y = y0 + fs * 0.35
+    while y + tw <= y1:
+        page.insert_text(
+            fitz.Point(x_r, y),
+            t,
+            fontsize=fs,
+            fontname="helv",
+            color=color,
+            rotate=90,
+            overlay=False,
+        )
+        y += step_v
+
+    y_bot = y1 - fs * 0.15
+    x = x1 - tw
+    while x >= x0:
+        page.insert_text(
+            fitz.Point(x, y_bot),
+            t,
+            fontsize=fs,
+            fontname="helv",
+            color=color,
+            overlay=False,
+        )
+        x -= chunk
+
+    x_l = x0 + fs * 0.22
+    y = y1 - fs * 0.2
+    while y - tw >= y0:
+        page.insert_text(
+            fitz.Point(x_l, y),
+            t,
+            fontsize=fs,
+            fontname="helv",
+            color=color,
+            rotate=270,
+            overlay=False,
+        )
+        y -= step_v
+
+
+def _add_watermark(page: fitz.Page, text: str, opacity: float, font_size: float, position: str) -> None:
+    """Place watermark using user-chosen size and position (normalized key).
+
+    Drawn with overlay=0 so it sits *behind* existing page content (text/images drawn
+    on top remain readable). Pure image-only pages may hide the mark where pixels are opaque.
+    """
+    r = page.rect
+    color = _watermark_gray_color(opacity)
+    fs = float(max(8.0, min(200.0, font_size)))
+
+    if position == "perimeter":
+        _add_perimeter_tiled_small(page, text, opacity, fs)
+        return
+
+    if position == "diagonal":
+        _add_diagonal_center_watermark(page, text, opacity, fs)
+        return
+
+    if position == "four_corners":
+        _add_subtle_four_corner_watermark(page, text, opacity, fs)
+        return
+
+    pw, ph = r.width, r.height
+    margin = min(pw, ph) * 0.035
+    # Single placement modes: cap size so one watermark does not cover the whole page
+    fs = min(fs, 30.0)
+    tw = fitz.get_text_length(text, fontname="helv", fontsize=fs)
+    th = fs * 1.45
+    box_w = min(max(tw + fs * 0.6, fs * 2.5), pw - 2 * margin)
+    box_h = min(th + fs * 0.3, ph - 2 * margin)
+
+    centers: dict[str, tuple[float, float]] = {
+        "top_left": (r.x0 + margin + box_w / 2, r.y0 + margin + box_h / 2),
+        "top_center": (r.x0 + pw / 2, r.y0 + margin + box_h / 2),
+        "top_right": (r.x1 - margin - box_w / 2, r.y0 + margin + box_h / 2),
+        "middle_left": (r.x0 + margin + box_w / 2, r.y0 + ph / 2),
+        "center": (r.x0 + pw / 2, r.y0 + ph / 2),
+        "middle_right": (r.x1 - margin - box_w / 2, r.y0 + ph / 2),
+        "bottom_left": (r.x0 + margin + box_w / 2, r.y1 - margin - box_h / 2),
+        "bottom_center": (r.x0 + pw / 2, r.y1 - margin - box_h / 2),
+        "bottom_right": (r.x1 - margin - box_w / 2, r.y1 - margin - box_h / 2),
+    }
+    cx, cy = centers[position]
+    rect = fitz.Rect(cx - box_w / 2, cy - box_h / 2, cx + box_w / 2, cy + box_h / 2)
+    rect = rect & r
+    page.insert_textbox(
+        rect,
+        text,
+        fontsize=fs,
+        fontname="helv",
         color=color,
-        morph=(c, fitz.Matrix(1.15, 1.15).prerotate(45)),
-        overlay=0,
+        align=fitz.TEXT_ALIGN_CENTER,
+        overlay=False,
     )
 
 
@@ -263,9 +537,10 @@ async def reorder_pages(req: dict = {"file_id": "", "page_indices": []}) -> dict
     out_dir = WORK_DIR / new_id
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pdf = out_dir / "input.pdf"
-    
+    _carry_no_wm_backup_if_present(file_id, out_dir)
+
     try:
-        doc = fitz.open(source)
+        doc = fitz_open_workspace_pdf(source)
         # Select pages in the new order (this also deletes any pages not in the list)
         doc.select(indices)
         doc.save(str(out_pdf), garbage=3, deflate=True)
@@ -292,12 +567,12 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict[str, Any]:
         # Check if it's already a PDF
         if file.filename.lower().endswith(".pdf"):
             shutil.move(str(temp_path), str(destination))
-            doc = fitz.open(destination)
+            doc = fitz_open_workspace_pdf(destination)
             is_encrypted = doc.is_encrypted
             doc.close()
         else:
             # Efficient image to PDF conversion (avoids size bloat)
-            img_doc = fitz.open(temp_path)
+            img_doc = fitz_open_workspace_pdf(temp_path)
             # Create a point-based page size from image pixels
             img_rect = img_doc[0].rect
             
@@ -336,12 +611,32 @@ async def unlock_pdf(req: PasswordRequest) -> dict[str, Any]:
             doc.close()
             raise HTTPException(status_code=401, detail="Invalid password")
         
-        # Save a decrypted version to overwrite input.pdf
-        tmp_path = path.with_suffix('.unlocked.pdf')
+        # Save decrypted versions so preview/edit can work without storing password.
+        tmp_path = path.with_suffix(".unlocked.pdf")
         doc.save(tmp_path)
         doc.close()
-        
+
         shutil.move(str(tmp_path), str(path))
+
+        outp = output_path(req.file_id)
+        if outp.exists():
+            try:
+                d2 = fitz.open(outp)
+                if d2.is_encrypted:
+                    ok2 = d2.authenticate(req.password)
+                    if ok2:
+                        tmp2 = outp.with_suffix(".unlocked.pdf")
+                        d2.save(tmp2)
+                        d2.close()
+                        shutil.move(str(tmp2), str(outp))
+                    else:
+                        d2.close()
+            except Exception:
+                pass
+
+        pwp = _workspace_user_password_path(req.file_id)
+        if pwp.exists():
+            pwp.unlink()
         return {"status": "success", "message": "PDF unlocked successfully"}
     except HTTPException:
         raise
@@ -357,7 +652,7 @@ async def source_pdf(file_id: str) -> FileResponse:
 
 @app.get("/preview/{file_id}/{page_number}")
 async def page_preview(file_id: str, page_number: int) -> FileResponse:
-    path = ensure_file(file_id)
+    path = resolve_pdf_path(file_id)
     doc = fitz.open(path)
 
     if page_number < 1 or page_number > doc.page_count:
@@ -365,7 +660,7 @@ async def page_preview(file_id: str, page_number: int) -> FileResponse:
         raise HTTPException(status_code=404, detail="Page not found")
 
     out_path = preview_path(file_id, page_number)
-    if not out_path.exists():
+    if _preview_png_stale(out_path, path):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         page = doc[page_number - 1]
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -377,20 +672,17 @@ async def page_preview(file_id: str, page_number: int) -> FileResponse:
 
 @app.get("/preview_edited/{file_id}/{page_number}")
 async def page_preview_edited(file_id: str, page_number: int) -> FileResponse:
+    path = resolve_pdf_path(file_id)
     out_path = preview_edited_path(file_id, page_number)
-    if out_path.exists():
+    if not _preview_png_stale(out_path, path):
         return FileResponse(path=out_path, media_type="image/png")
-    
-    # Fallback: generate from edited PDF if image not cached yet
-    path = output_path(file_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Edited PDF not found")
-    
+
     try:
         doc = fitz.open(path)
         if page_number < 1 or page_number > doc.page_count:
             doc.close()
             raise HTTPException(status_code=404, detail="Page not found")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         page = doc[page_number - 1]
         pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), alpha=False)
         pix.save(out_path)
@@ -399,13 +691,21 @@ async def page_preview_edited(file_id: str, page_number: int) -> FileResponse:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview generation failed: {e}")
-    
+
     return FileResponse(path=out_path, media_type="image/png")
 
 @app.get("/analyze/{file_id}")
 async def analyze_pdf(file_id: str) -> dict[str, Any]:
     path = ensure_file(file_id)
-    doc = fitz.open(path)
+    try:
+        doc = fitz.open(path)
+        if doc.is_encrypted:
+            doc.close()
+            raise HTTPException(status_code=401, detail="PDF is password-protected. Unlock it first.")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="PDF is password-protected. Unlock it first.")
     items: list[dict[str, Any]] = []
     pages: list[dict[str, float]] = []
 
@@ -505,7 +805,15 @@ async def analyze_pdf(file_id: str) -> dict[str, Any]:
 @app.post("/edit")
 async def edit_pdf(payload: EditRequest) -> dict[str, str]:
     path = ensure_file(payload.file_id)
-    doc = fitz.open(path)
+    try:
+        doc = fitz.open(path)
+        if doc.is_encrypted:
+            doc.close()
+            raise HTTPException(status_code=401, detail="PDF is password-protected. Unlock it first.")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="PDF is password-protected. Unlock it first.")
 
     normalized_edits = [
         item
@@ -517,7 +825,7 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
         shutil.copy(path, ensure_output_path(payload.file_id))
         # Generate previews from original too
         try:
-            preview_doc = fitz.open(ensure_output_path(payload.file_id))
+            preview_doc = fitz_open_workspace_pdf(ensure_output_path(payload.file_id))
             for pg_num in range(1, preview_doc.page_count + 1):
                 pg = preview_doc[pg_num - 1]
                 pix = pg.get_pixmap(matrix=fitz.Matrix(4, 4), alpha=False)
@@ -680,7 +988,7 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
 
     # Generate preview images immediately after saving
     try:
-        preview_doc = fitz.open(out_path)
+        preview_doc = fitz_open_workspace_pdf(out_path)
         for pg_num in range(1, preview_doc.page_count + 1):
             pg = preview_doc[pg_num - 1]
             pix = pg.get_pixmap(matrix=fitz.Matrix(4, 4), alpha=False)
@@ -695,26 +1003,77 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
 
 @app.post("/set_password")
 async def set_pdf_password(req: PasswordRequest) -> dict[str, str]:
+    pw = (req.password or "").strip()
+    if not pw:
+        raise HTTPException(status_code=400, detail="Password is required")
     path = output_path(req.file_id)
     if not path.exists():
         path = input_path(req.file_id)
         if not path.exists():
             raise HTTPException(status_code=404, detail="File not found")
-            
+
     try:
-        doc = fitz.open(path)
-        tmp_path = path.with_suffix('.tmp.pdf')
-        doc.save(
-            tmp_path, 
-            encryption=fitz.PDF_ENCRYPT_AES_256, 
-            owner_pw=req.password, 
-            user_pw=req.password
-        )
-        doc.close()
-        shutil.move(str(tmp_path), str(output_path(req.file_id)))
+        try:
+            doc = fitz.open(path)
+        except Exception:
+            try:
+                doc = fitz.open(path, password=pw)
+            except Exception as open_err:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Cannot open PDF. If it is already password-protected, enter the current password you used before.",
+                ) from open_err
+        if doc.is_encrypted and not doc.authenticate(pw):
+            _safe_fitz_close(doc)
+            raise HTTPException(
+                status_code=401,
+                detail="PDF is already password-protected. Enter the same password you used before, or unlock the file first.",
+            )
+        tmp_path = path.with_suffix(".tmp.pdf")
+        try:
+            doc.save(
+                tmp_path,
+                encryption=fitz.PDF_ENCRYPT_AES_256,
+                owner_pw=pw,
+                user_pw=pw,
+                garbage=4,
+                deflate=True,
+            )
+        except Exception as save_err:
+            _safe_fitz_close(doc)
+            err_msg = str(save_err).lower()
+            if "signature" in err_msg or "signed" in err_msg:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This PDF is digitally signed or restricted; encryption cannot be applied. Try a copy without signatures, or use another PDF.",
+                ) from save_err
+            # PyMuPDF often raises this vague message on signed / restricted PDFs — not that the user "lied" about encryption.
+            if "document closed or encrypted" in err_msg:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This PDF cannot be saved with a new password (often digitally signed or permission-locked). Use Print to PDF or Save As a copy, then set the password on that copy.",
+                ) from save_err
+            raise HTTPException(status_code=500, detail=str(save_err)) from save_err
+        _safe_fitz_close(doc)
+        out = output_path(req.file_id)
+        shutil.move(str(tmp_path), str(out))
+        # Previously only edited.pdf was encrypted; input.pdf stayed open — preview looked "unlocked".
+        shutil.copy2(str(out), str(input_path(req.file_id)))
+        # Do NOT persist password; require user to unlock to edit/preview.
+        pwp = _workspace_user_password_path(req.file_id)
+        if pwp.exists():
+            pwp.unlink()
+    except HTTPException:
+        raise
     except Exception as e:
+        el = str(e).lower()
+        if "document closed or encrypted" in el:
+            raise HTTPException(
+                status_code=400,
+                detail="This PDF cannot be saved with a new password (often digitally signed or permission-locked). Use Print to PDF or Save As a copy, then set the password on that copy.",
+            ) from e
         raise HTTPException(status_code=500, detail=str(e))
-        
+
     return {"status": "success", "message": "Password protected successfully"}
 
 
@@ -770,7 +1129,7 @@ def _pdf_to_image_zip_bytes(file_id: str, kind: str) -> tuple[bytes, str, str]:
     if kind not in ext_map:
         raise HTTPException(status_code=400, detail="Invalid image format")
 
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     zip_buffer = io.BytesIO()
 
     try:
@@ -842,7 +1201,11 @@ async def combine_pdfs(req: CombineRequest) -> dict[str, Any]:
         out_dir = WORK_DIR / new_id
         out_dir.mkdir(parents=True, exist_ok=True)
         out_pdf = out_dir / "input.pdf"
-        
+        for fid in req.file_ids:
+            if (WORK_DIR / fid / NO_WM_BACKUP_NAME).is_file():
+                _carry_no_wm_backup_if_present(fid, out_dir)
+                break
+
         result_doc = fitz.open()
         for fid in req.file_ids:
             # Check for existing combined output or fresh input
@@ -850,7 +1213,7 @@ async def combine_pdfs(req: CombineRequest) -> dict[str, Any]:
             for path in [output_path(fid), input_path(fid)]:
                 if path.exists():
                     try:
-                        next_doc = fitz.open(str(path))
+                        next_doc = fitz_open_workspace_pdf(path)
                         result_doc.insert_pdf(next_doc)
                         next_doc.close()
                         found = True
@@ -894,9 +1257,10 @@ async def compress_pdf(req: dict = {"file_id": "", "quality": 60}) -> dict[str, 
     out_dir = WORK_DIR / new_id
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pdf = out_dir / "input.pdf"
-    
+    _carry_no_wm_backup_if_present(file_id, out_dir)
+
     try:
-        doc = fitz.open(source)
+        doc = fitz_open_workspace_pdf(source)
         
         # Intense Optimization: Only process images if they actually exist and have real size
         for page in doc:
@@ -956,7 +1320,7 @@ async def upload_multiple(files: list[UploadFile] = File(...)) -> dict[str, Any]
             
         try:
             # Check if it's an image
-            img_doc = fitz.open(temp_img)
+            img_doc = fitz_open_workspace_pdf(temp_img)
             pdf_bytes = img_doc.convert_to_pdf()
             img_doc.close()
             
@@ -966,7 +1330,7 @@ async def upload_multiple(files: list[UploadFile] = File(...)) -> dict[str, Any]
         except Exception:
             # If it's already a PDF, just insert it
             if file.filename.lower().endswith(".pdf"):
-                pdf_doc = fitz.open(temp_img)
+                pdf_doc = fitz_open_workspace_pdf(temp_img)
                 doc.insert_pdf(pdf_doc)
                 pdf_doc.close()
         
@@ -983,7 +1347,7 @@ async def upload_multiple(files: list[UploadFile] = File(...)) -> dict[str, Any]
 @app.post("/split_pages")
 async def split_pages(req: SplitRequest) -> dict[str, Any]:
     path = resolve_pdf_path(req.file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         n = doc.page_count
         if not req.page_indices:
@@ -994,6 +1358,7 @@ async def split_pages(req: SplitRequest) -> dict[str, Any]:
                 raise HTTPException(status_code=400, detail=f"Invalid page number: {p}")
             indices.append(p - 1)
         new_id, out_pdf = _new_work_file_id()
+        _carry_no_wm_backup_if_present(req.file_id, out_pdf.parent)
         new_doc = fitz.open()
         for i in indices:
             new_doc.insert_pdf(doc, from_page=i, to_page=i)
@@ -1009,7 +1374,7 @@ async def rotate_pages(req: RotateRequest) -> dict[str, Any]:
     if req.angle not in (90, 180, 270):
         raise HTTPException(status_code=400, detail="angle must be 90, 180, or 270")
     path = resolve_pdf_path(req.file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         n = doc.page_count
         if req.pages is None or len(req.pages) == 0:
@@ -1025,6 +1390,7 @@ async def rotate_pages(req: RotateRequest) -> dict[str, Any]:
             cur = int(pg.rotation)
             pg.set_rotation((cur + req.angle) % 360)
         new_id, out_pdf = _new_work_file_id()
+        _carry_no_wm_backup_if_present(req.file_id, out_pdf.parent)
         doc.save(str(out_pdf), garbage=4, deflate=True)
     finally:
         doc.close()
@@ -1034,7 +1400,7 @@ async def rotate_pages(req: RotateRequest) -> dict[str, Any]:
 @app.post("/crop_page")
 async def crop_page(req: CropRequest) -> dict[str, Any]:
     path = resolve_pdf_path(req.file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         n = doc.page_count
         if req.page < 1 or req.page > n:
@@ -1053,6 +1419,7 @@ async def crop_page(req: CropRequest) -> dict[str, Any]:
             page.set_cropbox(r)
             page.set_mediabox(r)
         new_id, out_pdf = _new_work_file_id()
+        _carry_no_wm_backup_if_present(req.file_id, out_pdf.parent)
         doc.save(str(out_pdf), garbage=4, deflate=True)
     finally:
         doc.close()
@@ -1070,7 +1437,7 @@ async def crop_page_norm(req: CropNormRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Crop area too small")
 
     path = resolve_pdf_path(req.file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         n = doc.page_count
         if req.page < 1 or req.page > n:
@@ -1090,31 +1457,75 @@ async def crop_page_norm(req: CropNormRequest) -> dict[str, Any]:
             page.set_cropbox(r)
             page.set_mediabox(r)
         new_id, out_pdf = _new_work_file_id()
+        _carry_no_wm_backup_if_present(req.file_id, out_pdf.parent)
         doc.save(str(out_pdf), garbage=4, deflate=True)
     finally:
         doc.close()
     return {"file_id": new_id, "status": "success", "size": os.path.getsize(out_pdf)}
+
+
+def _pristine_pdf_for_watermark_backup(path: Path) -> Path:
+    """Prefer longest-lived pre-watermark bytes in this workspace folder."""
+    candidate = path.parent / NO_WM_BACKUP_NAME
+    if candidate.exists():
+        return candidate
+    return path
 
 
 @app.post("/watermark")
 async def watermark_pdf(req: WatermarkRequest) -> dict[str, Any]:
     text = (req.text or "Draft").strip() or "Draft"
-    path = resolve_pdf_path(req.file_id)
-    doc = fitz.open(path)
     try:
+        pos = _normalize_watermark_position(req.position)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    path = resolve_pdf_path(req.file_id)
+    backup_source = _pristine_pdf_for_watermark_backup(path)
+    doc = fitz_open_workspace_pdf(path)
+    try:
+        fs = float(req.font_size)
+        op = float(req.opacity)
         for i in range(len(doc)):
-            _add_diagonal_watermark(doc[i], text, float(req.opacity))
+            _add_watermark(doc[i], text, op, fs, pos)
         new_id, out_pdf = _new_work_file_id()
+        out_dir = WORK_DIR / new_id
         doc.save(str(out_pdf), garbage=4, deflate=True)
+        shutil.copy2(backup_source, out_dir / NO_WM_BACKUP_NAME)
     finally:
         doc.close()
     return {"file_id": new_id, "status": "success", "size": os.path.getsize(out_pdf)}
 
 
+@app.post("/remove_watermark")
+async def remove_watermark(req: RemoveWatermarkRequest) -> dict[str, Any]:
+    folder = WORK_DIR / req.file_id
+    clean = folder / NO_WM_BACKUP_NAME
+    if not clean.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No backup copy found. Open Watermark and tap Apply once (any text) to create a backup, "
+                "then Remove will work. Or upload the PDF again if it was never watermarked on this server."
+            ),
+        )
+    inp = input_path(req.file_id)
+    outp = output_path(req.file_id)
+    shutil.copy2(clean, inp)
+    shutil.copy2(clean, outp)
+    for pattern in ("preview-*.png", "preview_edited-*.png"):
+        for p in folder.glob(pattern):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    sz = os.path.getsize(inp)
+    return {"file_id": req.file_id, "status": "success", "size": sz}
+
+
 @app.get("/pdf_metadata/{file_id}")
 async def get_pdf_metadata(file_id: str) -> dict[str, Any]:
     path = resolve_pdf_path(file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         meta = dict(doc.metadata)
     finally:
@@ -1125,7 +1536,7 @@ async def get_pdf_metadata(file_id: str) -> dict[str, Any]:
 @app.post("/pdf_metadata")
 async def update_pdf_metadata(req: MetadataUpdateRequest) -> dict[str, Any]:
     path = resolve_pdf_path(req.file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         if req.strip:
             doc.set_metadata({})
@@ -1137,6 +1548,7 @@ async def update_pdf_metadata(req: MetadataUpdateRequest) -> dict[str, Any]:
                 m["author"] = req.author
             doc.set_metadata(m)
         new_id, out_pdf = _new_work_file_id()
+        _carry_no_wm_backup_if_present(req.file_id, out_pdf.parent)
         doc.save(str(out_pdf), garbage=4, deflate=True)
     finally:
         doc.close()
@@ -1149,7 +1561,7 @@ async def export_page_image(file_id: str, page_number: int, format: str = "png")
     if fmt not in ("png", "jpeg", "jpg"):
         raise HTTPException(status_code=400, detail="format must be png or jpeg")
     path = resolve_pdf_path(file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         if page_number < 1 or page_number > doc.page_count:
             raise HTTPException(status_code=404, detail="Page not found")
@@ -1176,7 +1588,7 @@ async def export_page_image(file_id: str, page_number: int, format: str = "png")
 @app.get("/export_text/{file_id}")
 async def export_text(file_id: str):
     path = resolve_pdf_path(file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         parts: list[str] = []
         for i in range(len(doc)):
@@ -1197,7 +1609,7 @@ async def export_docx(file_id: str):
     from docx import Document as DocxDocument
 
     path = resolve_pdf_path(file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         full_text: list[str] = []
         for i in range(len(doc)):
@@ -1296,6 +1708,26 @@ async def stamp_preview(stamp_id: str) -> FileResponse:
     return FileResponse(p, media_type="image/png", filename="stamp.png")
 
 
+def _insert_image_preserving_alpha(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    image_path: Path,
+    *,
+    keep_proportion: bool = True,
+) -> None:
+    """
+    Insert PNG/JPEG via Pixmap so RGBA alpha becomes a proper PDF soft mask.
+
+    Using insert_image(filename=...) alone can drop or mishandle transparency; many
+    viewers then show transparent pixels as solid black.
+    """
+    pix = fitz.Pixmap(str(image_path))
+    try:
+        page.insert_image(rect, pixmap=pix, keep_proportion=keep_proportion)
+    finally:
+        pix = None
+
+
 @app.post("/apply_stamp")
 async def apply_stamp(req: ApplyStampRequest) -> dict[str, Any]:
     for v in (req.x0, req.y0, req.x1, req.y1):
@@ -1311,7 +1743,7 @@ async def apply_stamp(req: ApplyStampRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Stamp expired or not found")
 
     path = resolve_pdf_path(req.file_id)
-    doc = fitz.open(path)
+    doc = fitz_open_workspace_pdf(path)
     try:
         n = doc.page_count
         if req.page < 1 or req.page > n:
@@ -1324,8 +1756,9 @@ async def apply_stamp(req: ApplyStampRequest) -> dict[str, Any]:
             m.x0 + req.x1 * m.width,
             m.y0 + req.y1 * m.height,
         )
-        page.insert_image(r, filename=str(stamp_path), keep_proportion=True)
+        _insert_image_preserving_alpha(page, r, stamp_path, keep_proportion=True)
         new_id, out_pdf = _new_work_file_id()
+        _carry_no_wm_backup_if_present(req.file_id, out_pdf.parent)
         doc.save(str(out_pdf), garbage=4, deflate=True)
     finally:
         doc.close()
@@ -1388,6 +1821,7 @@ async def sign_pkcs12(
 
     signed = await _sign_pdf_bytes_pkcs12(pdf_bytes, p12_bytes, password)
     new_id, out_path = _new_work_file_id()
+    _carry_no_wm_backup_if_present(file_id, out_path.parent)
     out_path.write_bytes(signed)
     return {"file_id": new_id, "size": out_path.stat().st_size, "status": "success"}
 

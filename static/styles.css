@@ -121,6 +121,7 @@ body {
   min-height: 0;
   background: #d0d0d0;
   overflow-y: auto;
+  overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   padding: 16px;
   position: relative;
@@ -137,12 +138,35 @@ body {
   box-sizing: border-box;
   background: transparent;
 }
-.pdf-box-wrapper.active, .pdf-box-wrapper.edited {
+.pdf-box-wrapper.edited {
   background: #ffffff;
 }
 .pdf-box-wrapper.active {
+  background: #ffffff;
   border: 2px solid #0070d6;
   z-index: 50;
+}
+
+/* First tap: selection only (screenshot 1) — thin blue frame + hollow corner handles; no edit focus yet */
+.pdf-box-wrapper.block-selected:not(.active) {
+  border: 1.5px solid #0070d6;
+  border-style: solid;
+  z-index: 55;
+  background: transparent;
+}
+.pdf-box-wrapper.block-selected:not(.active).edited {
+  background: #ffffff;
+}
+.pdf-box-wrapper.block-selected:not(.active) .resize-handle {
+  width: 14px;
+  height: 14px;
+  background-color: transparent;
+  border: 2px solid #0070d6;
+  box-sizing: border-box;
+}
+.pdf-box-wrapper.block-selected:not(.active) .pdf-text-input {
+  pointer-events: none;
+  cursor: default;
 }
 
 .pdf-text-input {
@@ -160,6 +184,10 @@ body {
   outline: none;
   display: block;
 }
+/* First tap selects the block (floating menu); editing only after Edit or when .active */
+.pdf-box-wrapper:not(.active):not(.block-selected) .pdf-text-input {
+  pointer-events: none;
+}
 .pdf-box-wrapper.active .pdf-text-input,
 .pdf-box-wrapper.edited .pdf-text-input {
   color: #333;
@@ -176,7 +204,11 @@ body {
   display: none; /* hidden by default */
   z-index: 60;
 }
+/* Corner circles only before Edit (block-selected). Hide while typing/editing (reference UI). */
 .pdf-box-wrapper.active .resize-handle {
+  display: none !important;
+}
+.pdf-box-wrapper.block-selected:not(.active) .resize-handle {
   display: block;
 }
 
@@ -203,7 +235,8 @@ body {
   justify-content: center;
   box-shadow: 0 1px 3px rgba(0,0,0,0.3);
 }
-.pdf-box-wrapper.active .move-handle { display: flex; }
+.pdf-box-wrapper.active .move-handle { display: none; }
+.pdf-box-wrapper.block-selected:not(.active) .move-handle { display: none; }
 .move-handle i { font-size: 11px; }
 
 .editor-bottom-wrap {
@@ -255,6 +288,51 @@ body {
 .editor-toolbar { height: 54px; display: flex; justify-content: space-between; align-items: center; padding: 0 8px; overflow-x: auto; background: #fafafa;}
 .editor-toolbar::-webkit-scrollbar { display: none; }
 .editor-toolbar .icon-btn { font-size: 18px; flex-shrink: 0; color: #555; }
+.editor-toolbar .icon-btn.toolbar-btn-active {
+  color: #0070d6;
+}
+
+/* Floating bar above selected block (Edit / Select / Copy / Delete) */
+.pdf-block-float-menu {
+  position: fixed;
+  z-index: 250;
+  display: flex;
+  align-items: stretch;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+  font-family: 'Roboto', sans-serif;
+  max-width: calc(100vw - 24px);
+  left: 0;
+  top: 0;
+}
+.pdf-block-float-menu.hidden {
+  display: none !important;
+}
+.pdf-block-float-menu-btn {
+  background: none;
+  border: none;
+  padding: 11px 12px;
+  font-size: 15px;
+  font-weight: 400;
+  color: #111;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+.pdf-block-float-menu-btn:active {
+  background: #f0f0f0;
+}
+.pdf-block-float-menu-sep {
+  width: 1px;
+  align-self: stretch;
+  min-height: 24px;
+  margin: 8px 0;
+  background: #e0e0e0;
+  flex-shrink: 0;
+}
 .toolbar-separator { width: 1px; height: 24px; background: #ddd; margin: 0 8px; flex-shrink: 0; }
 
 /* Loading overlay */

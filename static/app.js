@@ -4,6 +4,9 @@ const pdfFile = document.getElementById("pdfFile");
 const loadingOverlay = document.getElementById("loadingOverlay");
 const uploadStatus = document.getElementById("uploadStatus");
 const pageEditor = document.getElementById("pageEditor");
+const pdfBlockFloatMenu = document.getElementById("pdfBlockFloatMenu");
+/** @type {HTMLElement | null} */
+let pdfFloatMenuTargetBox = null;
 const saveBtn = document.getElementById("saveBtn");
 const closeEditorBtn = document.getElementById("closeEditorBtn");
 const recentFilesList = document.getElementById("recentFilesList");
@@ -80,17 +83,24 @@ function isMobileDownloadEnvironment() {
   return coarse || ua;
 }
 
+function buildDownloadUrl(fileId, filename) {
+  const u = new URL(`${window.location.origin}/download/${fileId}`);
+  u.searchParams.set("filename", filename);
+  return u.toString();
+}
+
 /**
  * @param {string} fileId
  * @param {string} filename suggested filename (query + download attr)
- * @returns {boolean} true if the page is navigating away (mobile path)
+ * @returns {boolean} true if navigation/new-tab path (no in-page success toast needed)
  */
 function downloadPdfByFileId(fileId, filename) {
-  const u = new URL(`${window.location.origin}/download/${fileId}`);
-  u.searchParams.set("filename", filename);
-  const url = u.toString();
+  const url = buildDownloadUrl(fileId, filename);
   if (isMobileDownloadEnvironment()) {
-    window.location.assign(url);
+    const w = window.open(url, "_blank", "noopener,noreferrer");
+    if (!w || typeof w.closed === "undefined") {
+      window.location.assign(url);
+    }
     return true;
   }
   const link = document.createElement("a");
@@ -160,6 +170,16 @@ function wireShareSheetActions() {
 
   document.getElementById("shareSendCompressedBtn")?.addEventListener("click", async () => {
     if (!requireShareFileOrAlert()) return;
+    // Open a tab synchronously (still part of the tap). After await(fetch) the browser may block
+    // window.open/assign — this preserves a valid target for the download URL.
+    let downloadTab = null;
+    if (isMobileDownloadEnvironment()) {
+      try {
+        downloadTab = window.open("about:blank", "_blank", "noopener,noreferrer");
+      } catch {
+        /* ignore */
+      }
+    }
     const fid = shareContextFile.id;
     const idx = mockFiles.findIndex((f) => f.id === fid);
     shareSheetOverlay?.classList.add("hidden");
@@ -174,23 +194,43 @@ function wireShareSheetActions() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file_id: fid, quality: targetQuality }),
       });
-      if (!res.ok) throw new Error("Compression failed.");
+      if (!res.ok) {
+        let detail = "Compression failed.";
+        try {
+          const j = await res.json();
+          if (j.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail);
+      }
       const json = await res.json();
       if (idx > -1) {
         mockFiles[idx].id = json.file_id;
         mockFiles[idx].size = json.size;
         mockFiles[idx].compressionCount = (mockFiles[idx].compressionCount || 0) + 1;
-        mockFiles[idx].title =
-          mockFiles[idx].title.replace(".pdf", "").replace("_compressed", "") + "_compressed.pdf";
         shareContextFile = mockFiles[idx];
       }
       renderMockFiles();
+      persistRecentFiles();
       const name = getDownloadFilenameForFileId(json.file_id);
-      const navigatedAway = downloadPdfByFileId(json.file_id, name);
-      if (!navigatedAway) {
-        showCustomAlert("Success", "Compressed PDF downloaded.", true);
+      const dl = buildDownloadUrl(json.file_id, name);
+      if (downloadTab && !downloadTab.closed) {
+        downloadTab.location.href = dl;
+      } else {
+        const navigatedAway = downloadPdfByFileId(json.file_id, name);
+        if (!navigatedAway) {
+          showCustomAlert("Success", "Compressed PDF downloaded.", true);
+        }
       }
     } catch (err) {
+      if (downloadTab && !downloadTab.closed) {
+        try {
+          downloadTab.close();
+        } catch {
+          /* ignore */
+        }
+      }
       showCustomAlert("Failed", err.message || String(err), false);
     } finally {
       loadingOverlay.classList.add("hidden");
@@ -510,6 +550,330 @@ document.querySelector(".editor-toolbar")?.addEventListener("click", () => {
   editorToolbarHistoryTimer = setTimeout(() => pushEditorHistory(), 80);
 });
 
+function hidePdfBlockFloatMenu() {
+  pdfFloatMenuTargetBox = null;
+  if (pdfBlockFloatMenu) {
+    pdfBlockFloatMenu.classList.add("hidden");
+    pdfBlockFloatMenu.setAttribute("aria-hidden", "true");
+  }
+}
+
+/**
+ * After zoom (scale on .page-stage), scroll #pageEditor so the active text box sits in the
+ * middle of the visible workspace (corner / left / right / middle — same target).
+ * Multiple passes fix residual offset after scroll reflow.
+ */
+function centerEditableBoxInEditor(boxWrapper) {
+  const scroller = document.getElementById("pageEditor");
+  if (!scroller || !boxWrapper) return;
+  const passes = 5;
+  const eps = 0.75;
+  for (let p = 0; p < passes; p++) {
+    const sr = scroller.getBoundingClientRect();
+    const br = boxWrapper.getBoundingClientRect();
+    const boxCx = br.left + br.width / 2;
+    const boxCy = br.top + br.height / 2;
+    const viewCx = sr.left + sr.width / 2;
+    const viewCy = sr.top + sr.height / 2;
+    const dX = boxCx - viewCx;
+    const dY = boxCy - viewCy;
+    if (Math.abs(dX) < eps && Math.abs(dY) < eps) break;
+    let nextL = scroller.scrollLeft + dX;
+    let nextT = scroller.scrollTop + dY;
+    const maxL = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+    const maxT = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    nextL = Math.max(0, Math.min(nextL, maxL));
+    nextT = Math.max(0, Math.min(nextT, maxT));
+    scroller.scrollLeft = nextL;
+    scroller.scrollTop = nextT;
+  }
+}
+
+function applyZoomToBoxContext(boxWrapper) {
+  if (!boxWrapper) return;
+  const pageWrapper = boxWrapper.closest(".page-wrapper");
+  const stage = pageWrapper ? pageWrapper.querySelector(".page-stage") : null;
+  if (!pageWrapper || !stage) return;
+
+  // Capture base unscaled dimensions and lockdown physics
+  stage.style.transform = "scale(1)";
+  const unscaledW = stage.offsetWidth;
+  const unscaledH = stage.offsetHeight;
+
+  // Lock stage dimensions so it doesn't implicitly stretch when parent is inflated
+  stage.style.width = `${unscaledW}px`;
+  stage.style.height = `${unscaledH}px`;
+
+  // Physical visual zoom locked strictly to top-left to avoid negative clipping
+  stage.style.transformOrigin = "0 0";
+  stage.style.transform = "scale(1.6)";
+  pageWrapper.style.zIndex = "50";
+
+  // Inflate the container size directly to unlock absolute native scroll routing limits
+  pageWrapper.style.width = `${unscaledW * 1.6}px`;
+  pageWrapper.style.height = `${unscaledH * 1.6}px`;
+
+  // .page-stage animates transform ~300ms — center after zoom settles, then once more after layout
+  const centerAfterZoom = () => centerEditableBoxInEditor(boxWrapper);
+  setTimeout(() => {
+    centerAfterZoom();
+    requestAnimationFrame(() => {
+      centerAfterZoom();
+      setTimeout(centerAfterZoom, 50);
+    });
+  }, 350);
+}
+
+function updatePdfBlockFloatMenuPosition() {
+  if (!pdfBlockFloatMenu || pdfBlockFloatMenu.classList.contains("hidden")) return;
+  const box = pdfFloatMenuTargetBox;
+  if (!box) return;
+  const rect = box.getBoundingClientRect();
+  const menu = pdfBlockFloatMenu;
+  const h = menu.offsetHeight || 44;
+  const w = menu.offsetWidth || 280;
+  let top = rect.top - h - 8;
+  if (top < 8) top = rect.bottom + 8;
+  const cx = rect.left + rect.width / 2;
+  const left = Math.min(Math.max(cx, w / 2 + 8), window.innerWidth - w / 2 - 8);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+  menu.style.transform = "translateX(-50%)";
+}
+
+function showPdfBlockFloatMenu(boxWrapper) {
+  pdfFloatMenuTargetBox = boxWrapper;
+  if (!pdfBlockFloatMenu) return;
+  pdfBlockFloatMenu.classList.remove("hidden");
+  pdfBlockFloatMenu.setAttribute("aria-hidden", "false");
+  updatePdfBlockFloatMenuPosition();
+  requestAnimationFrame(() => updatePdfBlockFloatMenuPosition());
+}
+
+function clearPdfBlockSelection() {
+  hidePdfBlockFloatMenu();
+  document.querySelectorAll(".pdf-box-wrapper.block-selected").forEach((w) => {
+    w.classList.remove("block-selected");
+    const a = w.querySelector(".pdf-text-input");
+    if (a) a.removeAttribute("readonly");
+  });
+}
+
+function selectPdfBlock(boxWrapper) {
+  const area = boxWrapper.querySelector(".pdf-text-input");
+  if (!area) return;
+  clearPdfBlockSelection();
+  boxWrapper.classList.add("block-selected");
+  area.setAttribute("readonly", "readonly");
+  showPdfBlockFloatMenu(boxWrapper);
+}
+
+function getFloatMenuTargetArea() {
+  if (!pdfFloatMenuTargetBox) return null;
+  return pdfFloatMenuTargetBox.querySelector(".pdf-text-input");
+}
+
+function syncFormattingToolbarFromArea(area) {
+  const boldBtn = document.getElementById("formatBoldBtn");
+  const italicBtn = document.getElementById("formatItalicBtn");
+  const underlineBtn = document.getElementById("formatUnderlineBtn");
+  const strikeBtn = document.getElementById("formatStrikeBtn");
+  const isBold = area.style.fontWeight === "bold";
+  const isItalic = area.style.fontStyle === "italic";
+  const u = area.style.textDecoration || "";
+  const isUnderline = u.includes("underline");
+  const isStrike = u.includes("line-through");
+  boldBtn?.classList.toggle("toolbar-btn-active", isBold);
+  italicBtn?.classList.toggle("toolbar-btn-active", isItalic);
+  underlineBtn?.classList.toggle("toolbar-btn-active", isUnderline);
+  strikeBtn?.classList.toggle("toolbar-btn-active", isStrike);
+}
+
+function enterPdfBlockEditMode(boxWrapper) {
+  const area = boxWrapper.querySelector(".pdf-text-input");
+  if (!area) return;
+  clearPdfBlockSelection();
+  document.querySelectorAll(".pdf-box-wrapper").forEach((w) => w.classList.remove("active"));
+  boxWrapper.classList.add("active");
+  area.removeAttribute("readonly");
+  lastActiveArea = area;
+  syncFormattingToolbarFromArea(area);
+  area.focus();
+}
+
+function wirePdfBlockFloatMenuOnce() {
+  if (!pdfBlockFloatMenu || pdfBlockFloatMenu.dataset.wired === "1") return;
+  pdfBlockFloatMenu.dataset.wired = "1";
+
+  pdfBlockFloatMenu.addEventListener("mousedown", (e) => e.stopPropagation());
+  pdfBlockFloatMenu.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    if (action === "edit") {
+      const box = pdfFloatMenuTargetBox;
+      if (box) enterPdfBlockEditMode(box);
+      return;
+    }
+    if (action === "select") {
+      const box = pdfFloatMenuTargetBox;
+      if (box) {
+        enterPdfBlockEditMode(box);
+        const a = box.querySelector(".pdf-text-input");
+        if (a) requestAnimationFrame(() => { a.focus(); a.select(); });
+      }
+      return;
+    }
+    if (action === "copy") {
+      const a = getFloatMenuTargetArea();
+      if (a) {
+        void navigator.clipboard.writeText(a.value || "").catch(() => {});
+      }
+      return;
+    }
+    if (action === "delete") {
+      const a = getFloatMenuTargetArea();
+      if (!a) return;
+      const box = a.closest(".pdf-box-wrapper");
+      a.value = "";
+      if (box) box.classList.add("edited");
+      clearPdfBlockSelection();
+      pushEditorHistory();
+    }
+  });
+
+  if (pageEditor && !pageEditor.dataset.pdfFloatScrollBound) {
+    pageEditor.dataset.pdfFloatScrollBound = "1";
+    pageEditor.addEventListener(
+      "scroll",
+      () => {
+        if (pdfBlockFloatMenu && !pdfBlockFloatMenu.classList.contains("hidden")) {
+          updatePdfBlockFloatMenuPosition();
+        }
+      },
+      { passive: true }
+    );
+  }
+  window.addEventListener("resize", () => {
+    if (pdfBlockFloatMenu && !pdfBlockFloatMenu.classList.contains("hidden")) {
+      updatePdfBlockFloatMenuPosition();
+    }
+  });
+}
+
+wirePdfBlockFloatMenuOnce();
+
+/**
+ * Server says PDF is encrypted (/analyze 401 or upload needs_password). Prompt for password and POST /unlock.
+ * @returns {Promise<boolean>} true if unlocked, false if user cancelled
+ */
+async function promptUnlockUntilSuccess(fileId) {
+  let success = false;
+  while (!success) {
+    loadingOverlay.classList.add("hidden");
+    const pw = await showCustomPrompt("This PDF is protected", "", "Enter password to unlock", true);
+    if (pw === null) return false;
+    loadingOverlay.classList.remove("hidden");
+    uploadStatus.textContent = "Unlocking PDF...";
+    try {
+      const unlockRes = await fetch("/unlock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_id: fileId, password: pw }),
+      });
+      if (unlockRes.ok) {
+        success = true;
+      } else {
+        loadingOverlay.classList.add("hidden");
+        showCustomAlert("Wrong password", "Incorrect password. Please try again.", false);
+      }
+    } catch {
+      loadingOverlay.classList.add("hidden");
+      showCustomAlert("Unlock failed", "Could not reach the server.", false);
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Thumbnail / title: open Preview (page images), not the editor. */
+async function openPreviewFromHome(file) {
+  if (!file?.id) {
+    showCustomAlert("Demo", "Upload a real PDF first.", false);
+    return;
+  }
+  loadingOverlay.classList.remove("hidden");
+  uploadStatus.textContent = "Loading preview...";
+  try {
+    let res = await fetch(`/analyze/${file.id}`);
+    if (res.status === 401) {
+      const unlocked = await promptUnlockUntilSuccess(file.id);
+      if (!unlocked) return;
+      res = await fetch(`/analyze/${file.id}`);
+      if (res.status === 401) {
+        showCustomAlert("Password required", "Could not unlock this PDF.", false);
+        return;
+      }
+    }
+    if (!res.ok) {
+      let msg = "Could not load preview.";
+      try {
+        const j = await res.json();
+        if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(msg);
+    }
+    const json = await res.json();
+    const pages = json.pages || [];
+    const previewView = document.getElementById("preview-view");
+    const previewContainer = document.getElementById("preview-container");
+    if (!previewView || !previewContainer) return;
+    previewContainer.innerHTML = "";
+    pages.forEach((p) => {
+      const img = document.createElement("img");
+      img.src = `/preview/${file.id}/${p.page}?v=${Date.now()}`;
+      img.style.width = "100%";
+      img.style.marginBottom = "16px";
+      img.style.boxShadow = "0 2px 6px rgba(0,0,0,0.15)";
+      img.style.backgroundColor = "white";
+      img.alt = `Page ${p.page}`;
+      previewContainer.appendChild(img);
+    });
+    currentFileId = file.id;
+    homeView.classList.remove("active");
+    editorView.classList.remove("active");
+    previewView.classList.add("active");
+
+    const finalDlBtns = [document.getElementById("final-download-btn"), document.getElementById("final-download-btn-bottom")];
+    finalDlBtns.forEach((btn) => {
+      if (!btn) return;
+      const newBtn = btn.cloneNode(true);
+      btn.replaceWith(newBtn);
+      newBtn.addEventListener("click", () => {
+        const fname = getDownloadFilenameForFileId(file.id);
+        downloadPdfByFileId(file.id, fname);
+      });
+    });
+
+    const backBtn = document.getElementById("back-to-edit-btn");
+    if (backBtn) {
+      const newBack = backBtn.cloneNode(true);
+      backBtn.replaceWith(newBack);
+      newBack.addEventListener("click", () => {
+        previewView.classList.remove("active");
+        homeView.classList.add("active");
+      });
+    }
+  } catch (e) {
+    showCustomAlert("Preview failed", e.message || String(e), false);
+  } finally {
+    loadingOverlay.classList.add("hidden");
+  }
+}
+
 function renderMockFiles() {
   recentFilesList.innerHTML = "";
   if (mockFiles.length === 0) {
@@ -596,7 +960,16 @@ function renderMockFiles() {
          loadingOverlay.classList.remove("hidden");
          uploadStatus.textContent = "Loading file...";
          try {
-             const res = await fetch(`/analyze/${file.id}`);
+             let res = await fetch(`/analyze/${file.id}`);
+             if (res.status === 401) {
+               const unlocked = await promptUnlockUntilSuccess(file.id);
+               if (!unlocked) return;
+               res = await fetch(`/analyze/${file.id}`);
+               if (res.status === 401) {
+                 showCustomAlert("Password required", "Could not unlock this PDF.", false);
+                 return;
+               }
+             }
              if (!res.ok) throw new Error("Load failed");
              const json = await res.json();
              originalItems = json.items || [];
@@ -652,23 +1025,23 @@ function renderMockFiles() {
 
     const thumbEl = card.querySelector(".fc-thumb");
     const titleEl = card.querySelector(".fc-title");
-    const openEditorFromThumbOrTitle = (e) => {
+    const openPreviewFromThumbOrTitle = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      openEditor();
+      void openPreviewFromHome(file);
     };
-    thumbEl?.addEventListener("click", openEditorFromThumbOrTitle);
-    titleEl?.addEventListener("click", openEditorFromThumbOrTitle);
+    thumbEl?.addEventListener("click", openPreviewFromThumbOrTitle);
+    titleEl?.addEventListener("click", openPreviewFromThumbOrTitle);
     thumbEl?.setAttribute("role", "button");
     thumbEl?.setAttribute("tabindex", "0");
-    thumbEl?.setAttribute("aria-label", "Open PDF");
+    thumbEl?.setAttribute("aria-label", "Preview");
     titleEl?.setAttribute("role", "button");
     titleEl?.setAttribute("tabindex", "0");
-    titleEl?.setAttribute("aria-label", "Open PDF");
+    titleEl?.setAttribute("aria-label", "Preview");
     const keyOpen = (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        openEditor();
+        void openPreviewFromHome(file);
       }
     };
     thumbEl?.addEventListener("keydown", keyOpen);
@@ -769,7 +1142,6 @@ document.getElementById("compressPdfBtn")?.addEventListener('click', async () =>
                 mockFiles[idx].id = json.file_id;
                 mockFiles[idx].size = json.size;
                 mockFiles[idx].compressionCount = (mockFiles[idx].compressionCount || 0) + 1;
-                mockFiles[idx].title = (mockFiles[idx].title.replace(".pdf", "").replace("_compressed", "") + "_compressed.pdf");
             }
             
             renderMockFiles();
@@ -861,6 +1233,10 @@ document.getElementById('renameOptionBtn')?.addEventListener('click', async () =
         selectedMoreFile.fileObj.title = titleText;
         const titleEl = selectedMoreFile.cardEl.querySelector('.fc-title');
         if (titleEl) titleEl.textContent = titleText;
+        if (shareContextFile && shareContextFile.id === selectedMoreFile.fileObj.id) {
+          shareContextFile.title = titleText;
+        }
+        persistRecentFiles();
     }
 });
 
@@ -889,7 +1265,16 @@ document.getElementById('setPasswordBtn')?.addEventListener('click', async () =>
             body: JSON.stringify({ file_id: file.id, password: pw })
         });
         
-        if (!res.ok) throw new Error("Failed to set password.");
+        if (!res.ok) {
+            let msg = "Failed to set password.";
+            try {
+                const data = await res.json();
+                if (data.detail != null) {
+                    msg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+                }
+            } catch (_) { /* keep generic */ }
+            throw new Error(msg);
+        }
         alert("Password protected successfully! Anyone opening this will now need the password.");
     } catch (err) {
         alert("Error: " + err.message);
@@ -1346,7 +1731,7 @@ document.getElementById('combineFilesBtn')?.addEventListener('click', () => {
     document.getElementById("moreOptionsSheetOverlay")?.classList.add("hidden");
     if (selectedMoreFile) {
         selectedCombineFiles = [selectedMoreFile.fileObj];
-        document.getElementById("combineFileName").value = selectedMoreFile.fileObj.title.replace(".pdf", "") + "_combined";
+        document.getElementById("combineFileName").value = selectedMoreFile.fileObj.title.replace(/\.pdf$/i, "");
     }
     homeView.classList.remove("active");
     combineView.classList.add("active");
@@ -1524,30 +1909,10 @@ pdfFile.addEventListener("change", async (e) => {
     const firstFile = files[0];
     const totalSize = Array.from(files).reduce((acc, f) => acc + f.size, 0);
 
-    // Password Check logic
+    // Password Check logic (same unlock prompt as preview / edit from home)
     if (uploadJson.needs_password) {
-        loadingOverlay.classList.add("hidden");
-        let success = false;
-        while (!success) {
-            const pw = await showCustomPrompt("This PDF is protected", "", "Enter password to unlock", true);
-            if (pw === null) throw new Error("Upload cancelled (PDF is encrypted)");
-            
-            loadingOverlay.classList.remove("hidden");
-            uploadStatus.textContent = "Unlocking PDF...";
-            
-            const unlockRes = await fetch("/unlock", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ file_id: currentFileId, password: pw })
-            });
-            
-            if (unlockRes.ok) {
-                success = true;
-            } else {
-                loadingOverlay.classList.add("hidden");
-                alert("Incorrect password. Please try again.");
-            }
-        }
+        const unlocked = await promptUnlockUntilSuccess(currentFileId);
+        if (!unlocked) throw new Error("Upload cancelled (PDF is encrypted)");
     }
 
     uploadStatus.textContent = "Analyzing structure...";
@@ -1763,33 +2128,29 @@ async function renderEditor(pages, items) {
         handle.addEventListener('touchstart', startDrag, {passive: false});
       });
 
+      boxWrapper.addEventListener('mousedown', (e) => {
+        if (e.target.closest('.resize-handle')) return;
+        if (e.target.closest('.move-handle')) return;
+        if (boxWrapper.classList.contains('active')) return;
+        e.preventDefault();
+      }, true);
+
+      boxWrapper.addEventListener('click', (e) => {
+        if (e.target.closest('.resize-handle')) return;
+        if (e.target.closest('.move-handle')) return;
+        if (boxWrapper.classList.contains('active')) return;
+        e.stopPropagation();
+        selectPdfBlock(boxWrapper);
+      });
+
       area.addEventListener("focus", () => {
         lastActiveArea = area;
         document.querySelectorAll('.pdf-box-wrapper').forEach(w => w.classList.remove('active'));
+        boxWrapper.classList.remove('block-selected');
         boxWrapper.classList.add('active');
-
-        // Capture base unscaled dimensions and lockdown physics
-        stage.style.transform = "scale(1)";
-        const unscaledW = stage.offsetWidth;
-        const unscaledH = stage.offsetHeight;
-        
-        // Lock stage dimensions so it doesn't implicitly stretch when parent is inflated
-        stage.style.width = `${unscaledW}px`;
-        stage.style.height = `${unscaledH}px`;
-        
-        // Physical visual zoom locked strictly to top-left to avoid negative clipping!
-        stage.style.transformOrigin = "0 0";
-        stage.style.transform = `scale(1.6)`;
-        pageWrapper.style.zIndex = "50"; 
-        
-        // Inflate the container size directly to unlock absolute native scroll routing limits
-        pageWrapper.style.width = `${unscaledW * 1.6}px`;
-        pageWrapper.style.height = `${unscaledH * 1.6}px`;
-        
-        // The mobile OS can seamlessly center it now
-        setTimeout(() => {
-           boxWrapper.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-        }, 300);
+        area.removeAttribute('readonly');
+        syncFormattingToolbarFromArea(area);
+        applyZoomToBoxContext(boxWrapper);
       });
       
       area.addEventListener("blur", (e) => {
@@ -1888,12 +2249,22 @@ async function renderEditor(pages, items) {
 
     stage.addEventListener('mousedown', (e) => {
         if(e.target === overlay || e.target === img) {
-            document.querySelectorAll('.pdf-box-wrapper').forEach(w => w.classList.remove('active'));
+            document.querySelectorAll('.pdf-box-wrapper').forEach(w => {
+              w.classList.remove('active');
+              w.classList.remove('block-selected');
+            });
+            document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => a.removeAttribute('readonly'));
+            hidePdfBlockFloatMenu();
         }
     });
     stage.addEventListener('touchstart', (e) => {
         if(e.target === overlay || e.target === img) {
-            document.querySelectorAll('.pdf-box-wrapper').forEach(w => w.classList.remove('active'));
+            document.querySelectorAll('.pdf-box-wrapper').forEach(w => {
+              w.classList.remove('active');
+              w.classList.remove('block-selected');
+            });
+            document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => a.removeAttribute('readonly'));
+            hidePdfBlockFloatMenu();
         }
     }, {passive: true});
   }
@@ -2039,29 +2410,29 @@ async function renderEditor(pages, items) {
       handle.addEventListener('touchstart', startDrag, {passive: false});
     });
 
+    boxWrapper.addEventListener('mousedown', (e) => {
+      if (e.target.closest('.resize-handle')) return;
+      if (e.target.closest('.move-handle')) return;
+      if (boxWrapper.classList.contains('active')) return;
+      e.preventDefault();
+    }, true);
+
+    boxWrapper.addEventListener('click', (e) => {
+      if (e.target.closest('.resize-handle')) return;
+      if (e.target.closest('.move-handle')) return;
+      if (boxWrapper.classList.contains('active')) return;
+      e.stopPropagation();
+      selectPdfBlock(boxWrapper);
+    });
+
     area.addEventListener("focus", () => {
       lastActiveArea = area;
       document.querySelectorAll('.pdf-box-wrapper').forEach(w => w.classList.remove('active'));
+      boxWrapper.classList.remove('block-selected');
       boxWrapper.classList.add('active');
-
-      stage.style.transform = "scale(1)";
-      const unscaledW = stage.offsetWidth;
-      const unscaledH = stage.offsetHeight;
-      
-      stage.style.width = `${unscaledW}px`;
-      stage.style.height = `${unscaledH}px`;
-      
-      stage.style.transformOrigin = "0 0";
-      stage.style.transform = `scale(1.6)`;
-      
-      const pageWrapper = stage.closest('.page-wrapper');
-      pageWrapper.style.zIndex = "50"; 
-      pageWrapper.style.width = `${unscaledW * 1.6}px`;
-      pageWrapper.style.height = `${unscaledH * 1.6}px`;
-      
-      setTimeout(() => {
-         boxWrapper.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-      }, 300);
+      area.removeAttribute('readonly');
+      syncFormattingToolbarFromArea(area);
+      applyZoomToBoxContext(boxWrapper);
     });
     
     area.addEventListener("blur", (e) => {
@@ -2146,6 +2517,7 @@ async function renderEditor(pages, items) {
           f = f.replace("-bold", "");
       }
       lastActiveArea.dataset.font = f;
+      syncFormattingToolbarFromArea(lastActiveArea);
   });
 
   document.getElementById("formatItalicBtn")?.addEventListener("click", () => {
@@ -2161,6 +2533,7 @@ async function renderEditor(pages, items) {
           f = f.replace("-italic", "");
       }
       lastActiveArea.dataset.font = f;
+      syncFormattingToolbarFromArea(lastActiveArea);
   });
 
   document.getElementById("formatUnderlineBtn")?.addEventListener("click", () => {
@@ -2168,6 +2541,7 @@ async function renderEditor(pages, items) {
       lastActiveArea.dataset.wasFormatted = '1';
       const isUnderlined = lastActiveArea.style.textDecoration === "underline";
       lastActiveArea.style.textDecoration = isUnderlined ? "none" : "underline";
+      syncFormattingToolbarFromArea(lastActiveArea);
   });
 
   document.getElementById("formatStrikeBtn")?.addEventListener("click", () => {
@@ -2175,6 +2549,7 @@ async function renderEditor(pages, items) {
       lastActiveArea.dataset.wasFormatted = '1';
       const isStruck = lastActiveArea.style.textDecoration === "line-through";
       lastActiveArea.style.textDecoration = isStruck ? "none" : "line-through";
+      syncFormattingToolbarFromArea(lastActiveArea);
   });
 
   document.getElementById("formatFontBtn")?.addEventListener("click", () => {
@@ -2222,9 +2597,15 @@ async function renderEditor(pages, items) {
   });
 
   document.getElementById("closeEditorBtn")?.addEventListener("click", () => {
-  editorView.classList.remove('active');
-  homeView.classList.add('active');
-});
+    hidePdfBlockFloatMenu();
+    document.querySelectorAll(".pdf-box-wrapper").forEach((w) => {
+      w.classList.remove("block-selected");
+      w.classList.remove("active");
+    });
+    document.querySelectorAll(".pdf-text-input").forEach((a) => a.removeAttribute("readonly"));
+    editorView.classList.remove("active");
+    homeView.classList.add("active");
+  });
 
 /** Reset mobile zoom so layout offsets match PDF math; must run before reading bboxes for save. */
 function normalizeEditorLayoutForSave() {
@@ -2240,7 +2621,12 @@ function normalizeEditorLayoutForSave() {
       pw.style.zIndex = "1";
     }
   });
-  document.querySelectorAll(".pdf-box-wrapper").forEach((w) => w.classList.remove("active"));
+  document.querySelectorAll(".pdf-box-wrapper").forEach((w) => {
+    w.classList.remove("active");
+    w.classList.remove("block-selected");
+  });
+  document.querySelectorAll(".pdf-text-input").forEach((a) => a.removeAttribute("readonly"));
+  hidePdfBlockFloatMenu();
   const ae = document.activeElement;
   if (ae && ae.classList && ae.classList.contains("pdf-text-input")) {
     ae.blur();
@@ -2418,18 +2804,16 @@ function parsePageSpec(str, maxPage) {
   return [...out].sort((a, b) => a - b);
 }
 
-function finishPdfToolOperation(json, titleSuffix) {
+function finishPdfToolOperation(json, _titleSuffix) {
   const oldId = selectedMoreFile?.fileObj?.id;
   const idx = mockFiles.findIndex((f) => f.id === oldId);
   if (idx > -1 && json && json.file_id) {
+    const keptTitle = mockFiles[idx].title;
     mockFiles[idx].id = json.file_id;
     mockFiles[idx].size = json.size ?? mockFiles[idx].size;
-    if (titleSuffix) {
-      const base = mockFiles[idx].title.replace(/\.pdf$/i, "");
-      mockFiles[idx].title = `${base}${titleSuffix}.pdf`;
-    }
-    if (selectedMoreFile && selectedMoreFile.fileObj) selectedMoreFile.fileObj = mockFiles[idx];
     mockFiles[idx].thumb = `/preview/${json.file_id}/1?v=${Date.now()}`;
+    mockFiles[idx].title = keptTitle;
+    if (selectedMoreFile && selectedMoreFile.fileObj) selectedMoreFile.fileObj = mockFiles[idx];
   }
   renderMockFiles();
 }
@@ -3159,23 +3543,52 @@ document.getElementById("watermarkPdfBtn")?.addEventListener("click", () => {
   if (!fid) return;
   openPdfToolModal(
     "Watermark",
-    `<p style="font-size:13px;color:#555;margin:0 0 10px;">Diagonal text on every page (e.g. Draft / Confidential).</p>
+    `<p style="font-size:13px;color:#555;margin:0 0 10px;line-height:1.45;">Text on <strong>every page</strong>. Har style alag need ke liye hai — zyada protection, classic look, halka mark, ya sirf ek jagah label.</p>
      <label style="font-size:13px;">Text</label>
-     <input type="text" id="wmText" class="prompt-input" style="width:100%;margin-bottom:10px;box-sizing:border-box;" value="Draft" />
-     <label style="font-size:13px;">Opacity (0.1–0.9, higher = darker)</label>
-     <input type="number" id="wmOp" class="prompt-input" style="width:100%" min="0.1" max="0.9" step="0.05" value="0.25" />`,
+     <input type="text" id="wmText" class="prompt-input" style="width:100%;margin-bottom:10px;box-sizing:border-box;" value="Draft" maxlength="100" />
+     <label style="font-size:13px;">Size hint (edge/corner modes = chhota text; single spot = max ~30pt)</label>
+     <input type="number" id="wmSize" class="prompt-input" style="width:100%;margin-bottom:10px;box-sizing:border-box;" min="8" max="200" step="1" value="48" />
+     <label style="font-size:13px;">Position — choose by your use case</label>
+     <select id="wmPos" class="prompt-input" style="width:100%;margin-bottom:10px;box-sizing:border-box;font-size:14px;">
+       <optgroup label="Strong coverage (offices, legal, confidential drafts)">
+         <option value="perimeter" selected>Repeat on all edges — small text, many copies; hardest to ignore or crop out</option>
+       </optgroup>
+       <optgroup label="Bold & obvious (classic “DRAFT” look)">
+         <option value="diagonal">Center diagonal — one large tilted line through the middle</option>
+       </optgroup>
+       <optgroup label="Light & readable (students, sharing, less clutter)">
+         <option value="four_corners">Four corners only — small label each corner; content stays clear</option>
+       </optgroup>
+       <optgroup label="Single spot (logo line, name, one stamp)">
+         <option value="center">Center</option>
+         <option value="top_center">Top center</option>
+         <option value="bottom_center">Bottom center</option>
+         <option value="top_left">Top left</option>
+         <option value="top_right">Top right</option>
+         <option value="middle_left">Middle left</option>
+         <option value="middle_right">Middle right</option>
+         <option value="bottom_left">Bottom left</option>
+         <option value="bottom_right">Bottom right</option>
+       </optgroup>
+     </select>
+     <label style="font-size:13px;">Opacity (0.05–0.95, higher = darker)</label>
+     <input type="number" id="wmOp" class="prompt-input" style="width:100%" min="0.05" max="0.95" step="0.05" value="0.25" />`,
     async () => {
       const text = document.getElementById("wmText")?.value?.trim() || "Draft";
+      let fontSize = parseFloat(document.getElementById("wmSize")?.value || "48");
+      if (Number.isNaN(fontSize)) fontSize = 48;
+      fontSize = Math.min(200, Math.max(8, fontSize));
+      const position = document.getElementById("wmPos")?.value || "center";
       let opacity = parseFloat(document.getElementById("wmOp")?.value || "0.25");
       if (Number.isNaN(opacity)) opacity = 0.25;
-      opacity = Math.min(0.9, Math.max(0.1, opacity));
+      opacity = Math.min(0.95, Math.max(0.05, opacity));
       loadingOverlay.classList.remove("hidden");
       uploadStatus.textContent = "Adding watermark…";
       try {
         const res = await fetch("/watermark", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ file_id: fid, text, opacity }),
+          body: JSON.stringify({ file_id: fid, text, opacity, font_size: fontSize, position }),
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
@@ -3192,6 +3605,37 @@ document.getElementById("watermarkPdfBtn")?.addEventListener("click", () => {
       }
     }
   );
+});
+
+document.getElementById("removeWatermarkBtn")?.addEventListener("click", async () => {
+  moreOptionsSheetOverlay?.classList.add("hidden");
+  const fid = requireMoreMenuFile();
+  if (!fid) return;
+  loadingOverlay.classList.remove("hidden");
+  uploadStatus.textContent = "Removing watermark…";
+  try {
+    const res = await fetch("/remove_watermark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_id: fid }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || "Could not remove watermark");
+    }
+    const json = await res.json();
+    const idx = mockFiles.findIndex((f) => f.id === fid);
+    if (idx > -1) {
+      mockFiles[idx].size = json.size ?? mockFiles[idx].size;
+      mockFiles[idx].thumb = `/preview/${fid}/1?v=${Date.now()}`;
+    }
+    renderMockFiles();
+    showCustomAlert("Done", "Watermark removed.", true);
+  } catch (e) {
+    showCustomAlert("Failed", e.message || String(e), false);
+  } finally {
+    loadingOverlay.classList.add("hidden");
+  }
 });
 
 document.getElementById("pdfMetadataBtn")?.addEventListener("click", async () => {
