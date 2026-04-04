@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from api.image_edit_tool import create_image_edit_router
+from api.image_edit_tool import create_image_edit_router, cleanup_ocr_items_for_editor
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -43,7 +43,7 @@ app = FastAPI(title="PDF Editor Tool")
 # Behind Render / other reverse proxies so request.url_for / schemes stay correct.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-app.include_router(create_image_edit_router(BASE_DIR, WORK_DIR))
+app.include_router(create_image_edit_router(WORK_DIR))
 
 
 class EditItem(BaseModel):
@@ -525,6 +525,14 @@ _FITZ_FONT_FALLBACKS: dict[str, list[str]] = {
     "cobi": ["Courier-BoldOblique"],
     "coit": ["Courier-Oblique"],
 }
+
+
+def _insert_font_size_for_rect(edit: EditItem, rect: fitz.Rect) -> float:
+    """OCR `size` can be low vs cell height; scale up so replaced text matches scan neighbors."""
+    fs = float(edit.size or 11)
+    h = max(0.1, float(rect.height))
+    from_h = h / 1.2
+    return max(fs, min(72.0, from_h * 0.94))
 
 
 def _insert_textbox_fit_try_font_chain(
@@ -1131,7 +1139,7 @@ def _ocr_items_rapid(page: fitz.Page, page_index: int) -> list[dict[str, Any]]:
                 "size": size,
             }
         )
-    return items
+    return cleanup_ocr_items_for_editor(items, page_w, page_h)
 
 
 @app.get("/analyze/{file_id}")
@@ -1167,6 +1175,11 @@ async def analyze_pdf(file_id: str) -> dict[str, Any]:
                 tp = page.get_textpage_ocr(full=True, dpi=150, language="eng")
                 ocr_dict = page.get_text("dict", textpage=tp)
                 page_items = _extract_items_from_text_dict(page_index, ocr_dict)
+                page_items = cleanup_ocr_items_for_editor(
+                    page_items,
+                    float(page.rect.width),
+                    float(page.rect.height),
+                )
             except Exception:
                 pass
         if not page_items:
@@ -1337,8 +1350,24 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
                 Double text/cut se bachne ke liye redaction rect ko text insert rect se
                 thoda bada rakhte hain.
                 """
-                if mode == "redact" and edit_item.original_bbox:
-                    raw = fitz.Rect(edit_item.original_bbox)
+                if mode == "redact":
+                    # Union tight OCR + editor bbox so bitmap ink is fully cleared; tight-only
+                    # redaction left old scan pixels and new text drew on top (double print).
+                    parts: list[fitz.Rect] = []
+                    if edit_item.original_bbox and _bbox_list_finite(
+                        edit_item.original_bbox
+                    ):
+                        parts.append(
+                            fitz.Rect([float(v) for v in edit_item.original_bbox])
+                        )
+                    if _bbox_list_finite(edit_item.bbox):
+                        parts.append(fitz.Rect([float(v) for v in edit_item.bbox]))
+                    if parts:
+                        raw = parts[0]
+                        for r in parts[1:]:
+                            raw |= r
+                    else:
+                        raw = fitz.Rect(edit_item.bbox)
                 else:
                     raw = fitz.Rect(edit_item.bbox)
                     if mode == "text" and edit_item.original_bbox:
@@ -1394,6 +1423,30 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
                 pad_x = min(pad_x + extra_x * mult_x, cap_x)
                 pad_y = min(pad_y + extra_y * mult_y, cap_y)
 
+                # Narrow table cells: horizontal redact padding was still eating the vertical grid
+                # between columns (e.g. List Price | Discount). Keep pad_x tiny vs cell width.
+                if mode == "redact" and w < 130 and h < 56:
+                    pad_x = min(
+                        pad_x,
+                        max(0.08, min(0.5, w * 0.014, base * 0.04)),
+                    )
+                    pad_y = min(
+                        pad_y,
+                        max(0.18, min(0.95, h * 0.1, base * 0.075)),
+                    )
+                if mode == "redact" and w < 75:
+                    pad_x = min(pad_x, max(0.06, w * 0.012))
+
+                # Tall OCR/table boxes were creating oversized white redaction strips in preview.
+                # Keep redact/text padding tight for column-like boxes so the original background stays intact.
+                if h > max(42.0, w * 1.7):
+                    if mode == "redact":
+                        pad_x = min(pad_x, max(1.2, w * 0.025))
+                        pad_y = min(pad_y, max(1.0, base * 0.10, h * 0.025))
+                    else:
+                        pad_x = min(pad_x, max(0.8, w * 0.02))
+                        pad_y = min(pad_y, max(0.8, base * 0.08, h * 0.02))
+
                 if mode == "text":
                     return fitz.Rect(raw.x0, raw.y0 - pad_y, raw.x1 + pad_x, raw.y1 + pad_y)
                 return fitz.Rect(raw.x0 - pad_x, raw.y0 - pad_y, raw.x1 + pad_x, raw.y1 + pad_y)
@@ -1429,7 +1482,7 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
                 rect = ir
                 text_rect = rect
                 font_name = _map_font_for_fitz(edit.font)
-                font_size = float(edit.size or 11)
+                font_size = _insert_font_size_for_rect(edit, ir)
                 safe_color = (edit.color or "#000000").strip() or "#000000"
                 _insert_textbox_fit_try_font_chain(
                     page, rect, text, font_name, font_size, safe_color, edit.align
@@ -1443,7 +1496,7 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
                         line_color = (0.0, 0.0, 0.0)
 
                     orig = text_rect
-                    font_sz = float(edit.size or 11)
+                    font_sz = font_size
                     font_name = _map_font_for_fitz(edit.font)
                     text_content = (edit.text or "").rstrip("\n")
 

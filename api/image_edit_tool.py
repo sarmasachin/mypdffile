@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-import io
 import json
 import math
 import re
-import uuid
 from pathlib import Path
 from typing import Any
 
 import fitz
 import numpy as np
-from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.templating import Jinja2Templates
-from PIL import Image, ImageOps
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from starlette.requests import Request
 
 _PREVIEW_HEADERS = {"Cache-Control": "no-store, max-age=0"}
 _rapid_ocr_engine: Any = None
@@ -512,51 +507,6 @@ def _apply_invoice_column_heuristics(
     return final_items
 
 
-def _ocr_items_for_image(img: Image.Image, page_index: int) -> list[dict[str, Any]]:
-    engine = _get_rapid_ocr_engine()
-    if engine is None:
-        return []
-
-    rgb = np.array(img.convert("RGB"))
-    height, width = rgb.shape[0], rgb.shape[1]
-    try:
-        ocr_out, _ = engine(rgb)
-    except Exception:
-        return []
-
-    items: list[dict[str, Any]] = []
-    for i, row in enumerate(ocr_out or []):
-        if not row or len(row) < 2:
-            continue
-        box, text = row[0], row[1]
-        txt = str(text or "").strip()
-        if not txt:
-            continue
-        try:
-            xs = [float(p[0]) for p in box]
-            ys = [float(p[1]) for p in box]
-        except Exception:
-            continue
-        x0 = max(0.0, min(xs))
-        x1 = min(float(width), max(xs))
-        y0 = max(0.0, min(ys))
-        y1 = min(float(height), max(ys))
-        bh = max(12.0, y1 - y0)
-        size = max(10.0, min(72.0, bh * 0.78))
-        items.append(
-            {
-                "id": f"p{page_index}-ocr-{i}",
-                "page": page_index + 1,
-                "text": txt,
-                "bbox": [x0, y0, x1, y1],
-                "font": "helv",
-                "size": size,
-                "color": "#111111",
-                "align": "left",
-            }
-        )
-    return _cleanup_ocr_items(items, float(width), float(height))
-
 
 def _ocr_items_for_pdf_page(page: fitz.Page, page_index: int) -> list[dict[str, Any]]:
     engine = _get_rapid_ocr_engine()
@@ -613,35 +563,8 @@ def _ocr_items_for_pdf_page(page: fitz.Page, page_index: int) -> list[dict[str, 
     return _cleanup_ocr_items(items, page_w, page_h)
 
 
-def create_image_edit_router(base_dir: Path, work_dir: Path) -> APIRouter:
+def create_image_edit_router(work_dir: Path) -> APIRouter:
     router = APIRouter()
-    templates = Jinja2Templates(directory=str(base_dir / "templates"))
-    tool_root = work_dir / "image-editable-pdf"
-    tool_root.mkdir(parents=True, exist_ok=True)
-
-    def _folder(file_id: str) -> Path:
-        return tool_root / file_id
-
-    def _input_pdf(file_id: str) -> Path:
-        return _folder(file_id) / "input.pdf"
-
-    def _edited_pdf(file_id: str) -> Path:
-        return _folder(file_id) / "edited.pdf"
-
-    def _preview_png(file_id: str, page_number: int) -> Path:
-        return _folder(file_id) / f"preview-{page_number}.png"
-
-    def _ocr_json(file_id: str) -> Path:
-        return _folder(file_id) / "ocr.json"
-
-    def _resolve_pdf(file_id: str) -> Path:
-        edited = _edited_pdf(file_id)
-        if edited.exists():
-            return edited
-        source = _input_pdf(file_id)
-        if source.exists():
-            return source
-        raise HTTPException(status_code=404, detail="File not found")
 
     def _main_folder(file_id: str) -> Path:
         return work_dir / file_id
@@ -661,143 +584,6 @@ def create_image_edit_router(base_dir: Path, work_dir: Path) -> APIRouter:
             return src
         raise HTTPException(status_code=404, detail="File not found")
 
-    @router.get("/image-to-editable-pdf", response_class=HTMLResponse)
-    async def image_to_editable_pdf_page(request: Request) -> HTMLResponse:
-        return templates.TemplateResponse("image_to_editable_pdf.html", {"request": request})
-
-    @router.post("/image_to_pdf_ocr/upload")
-    async def upload_images_for_editable_pdf(files: list[UploadFile] = File(...)) -> dict[str, Any]:
-        if not files:
-            raise HTTPException(status_code=400, detail="Please upload at least one image")
-
-        file_id = str(uuid.uuid4())
-        folder = _folder(file_id)
-        folder.mkdir(parents=True, exist_ok=True)
-        pdf_path = _input_pdf(file_id)
-
-        doc = fitz.open()
-        pages: list[dict[str, Any]] = []
-        items: list[dict[str, Any]] = []
-        names: list[str] = []
-        try:
-            for page_index, file in enumerate(files):
-                raw = await file.read()
-                if len(raw) < 32:
-                    continue
-                try:
-                    img = Image.open(io.BytesIO(raw))
-                    img = ImageOps.exif_transpose(img).convert("RGB")
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Unsupported image: {file.filename}") from e
-
-                names.append(file.filename or f"image-{page_index + 1}.png")
-                width, height = img.size
-                page = doc.new_page(width=width, height=height)
-
-                img_buf = io.BytesIO()
-                img.save(img_buf, format="PNG")
-                page.insert_image(page.rect, stream=img_buf.getvalue(), keep_proportion=False)
-
-                pages.append({"page": page_index + 1, "width": float(width), "height": float(height)})
-                items.extend(_ocr_items_for_image(img, page_index))
-
-            if doc.page_count == 0:
-                raise HTTPException(status_code=400, detail="No valid images were uploaded")
-
-            doc.save(str(pdf_path), garbage=3, deflate=True)
-        finally:
-            doc.close()
-
-        payload = {"file_id": file_id, "pages": pages, "items": items, "filenames": names}
-        _ocr_json(file_id).write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
-        return payload
-
-    @router.get("/image_to_pdf_ocr/preview/{file_id}/{page_number}")
-    async def preview_image_editable_pdf(file_id: str, page_number: int) -> FileResponse:
-        pdf_path = _resolve_pdf(file_id)
-        out_path = _preview_png(file_id, page_number)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        doc = fitz.open(pdf_path)
-        try:
-            if page_number < 1 or page_number > doc.page_count:
-                raise HTTPException(status_code=404, detail="Page not found")
-            page = doc[page_number - 1]
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-            pix.save(str(out_path))
-        finally:
-            doc.close()
-
-        return FileResponse(out_path, media_type="image/png", headers=_PREVIEW_HEADERS)
-
-    @router.post("/image_to_pdf_ocr/edit")
-    async def edit_image_based_pdf(payload: ImageEditRequest) -> dict[str, str]:
-        source = _input_pdf(payload.file_id)
-        if not source.exists():
-            raise HTTPException(status_code=404, detail="File not found")
-
-        edits = [
-            item
-            for item in payload.edits
-            if item.text is not None and _bbox_list_finite(item.bbox)
-        ]
-        doc = fitz.open(source)
-        try:
-            by_page: dict[int, list[ImageEditItem]] = {}
-            for item in edits:
-                by_page.setdefault(item.page - 1, []).append(item)
-
-            for page_index, page_edits in by_page.items():
-                if page_index < 0 or page_index >= doc.page_count:
-                    continue
-                page = doc[page_index]
-                valid_ops: list[tuple[ImageEditItem, fitz.Rect]] = []
-                for edit in page_edits:
-                    rr = _clip_rect_to_page(page, fitz.Rect(edit.bbox))
-                    if rr is None:
-                        continue
-                    rr = fitz.Rect(rr.x0 - 2, rr.y0 - 2, rr.x1 + 2, rr.y1 + 2) & page.rect
-                    valid_ops.append((edit, rr))
-
-                for _edit, rr in valid_ops:
-                    fill_rgb = _sample_background_fill_rgb(page, rr)
-                    page.add_redact_annot(rr, fill=fill_rgb)
-                if valid_ops:
-                    page.apply_redactions(
-                        images=fitz.PDF_REDACT_IMAGE_PIXELS,
-                        text=fitz.PDF_REDACT_TEXT_REMOVE,
-                    )
-
-                for edit, rr in valid_ops:
-                    txt = (edit.text or "").strip()
-                    if not txt:
-                        continue
-                    _insert_textbox_fit(
-                        page,
-                        rr,
-                        txt,
-                        _map_font_for_fitz(edit.font),
-                        float(edit.size or 11),
-                        edit.color or "#111111",
-                        edit.align or "left",
-                    )
-
-            out_path = _edited_pdf(payload.file_id)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            doc.save(str(out_path), garbage=3, deflate=True)
-        finally:
-            doc.close()
-
-        return {"download_url": f"/image_to_pdf_ocr/download/{payload.file_id}"}
-
-    @router.get("/image_to_pdf_ocr/download/{file_id}")
-    async def download_image_editable_pdf(file_id: str) -> FileResponse:
-        pdf_path = _resolve_pdf(file_id)
-        return FileResponse(
-            pdf_path,
-            media_type="application/pdf",
-            filename="image-editable.pdf",
-        )
 
     @router.get("/image_ocr_tool/analyze/{file_id}")
     async def analyze_existing_pdf_for_image_ocr(file_id: str) -> dict[str, Any]:
