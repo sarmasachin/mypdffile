@@ -31,7 +31,19 @@ function sanitizePdfFilename(name) {
 function getDownloadFilenameForFileId(fileId) {
   if (!fileId) return "document.pdf";
   const f = mockFiles.find((x) => x.id === fileId);
-  return sanitizePdfFilename(f?.title || "edited_document.pdf");
+  return sanitizePdfFilename(f?.title || "document.pdf");
+}
+
+/** FastAPI `detail` can be a string or a list of validation objects. */
+function formatServerDetail(detail) {
+  if (detail == null || detail === "") return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((x) => (x && typeof x.msg === "string" ? x.msg : JSON.stringify(x)))
+      .join("; ");
+  }
+  return String(detail);
 }
 
 function getShareDownloadUrl() {
@@ -496,8 +508,6 @@ function applyStylesFromSnapshot(items) {
     if (!it) continue;
     const st = it.style;
     if (st) {
-      if (st.fontWeight) a.style.fontWeight = st.fontWeight;
-      if (st.fontStyle) a.style.fontStyle = st.fontStyle;
       if (st.textDecoration) a.style.textDecoration = st.textDecoration;
       if (st.color) {
         a.style.color = st.color;
@@ -512,6 +522,7 @@ function applyStylesFromSnapshot(items) {
     }
     if (it.wasFormatted) a.dataset.wasFormatted = it.wasFormatted;
     else delete a.dataset.wasFormatted;
+    syncTextAreaVisualFromDatasetFont(a);
     const box = a.closest(".pdf-box-wrapper");
     if (box) {
       if (normalizeEditorText(a.value) !== normalizeEditorText(a.dataset.originalText)) box.classList.add("edited");
@@ -668,9 +679,42 @@ function selectPdfBlock(boxWrapper) {
   showPdfBlockFloatMenu(boxWrapper);
 }
 
+/** PDF text is a bitmap; moving the overlay leaves old ink visible — cover the drag-start rect with white once the box actually moves. */
+function ensurePdfMoveOriginCover(
+  boxWrapper,
+  corner,
+  existingCover,
+  startL,
+  startT,
+  startW,
+  startH,
+  newL,
+  newT
+) {
+  if (corner !== "move" || existingCover) return existingCover;
+  if (Math.abs(newL - startL) <= 2 && Math.abs(newT - startT) <= 2) return null;
+  const overlay = boxWrapper.parentElement;
+  if (!overlay || !overlay.classList.contains("overlay")) return null;
+  const c = document.createElement("div");
+  c.className = "pdf-move-origin-cover";
+  c.setAttribute("aria-hidden", "true");
+  c.style.cssText = `position:absolute;left:${startL}px;top:${startT}px;width:${startW}px;height:${startH}px;background:#ffffff;pointer-events:none;z-index:48;box-sizing:border-box`;
+  overlay.insertBefore(c, overlay.firstChild);
+  return c;
+}
+
 function getFloatMenuTargetArea() {
   if (!pdfFloatMenuTargetBox) return null;
   return pdfFloatMenuTargetBox.querySelector(".pdf-text-input");
+}
+
+/** Bold/italic for PDF save live in `dataset.font`; mirror them on the textarea (single-block formatting). */
+function syncTextAreaVisualFromDatasetFont(area) {
+  if (!area) return;
+  const f = (area.dataset.font || "").toLowerCase();
+  area.style.fontWeight = f.includes("bold") ? "bold" : "normal";
+  area.style.fontStyle =
+    f.includes("italic") || f.includes("oblique") ? "italic" : "normal";
 }
 
 function syncFormattingToolbarFromArea(area) {
@@ -678,6 +722,7 @@ function syncFormattingToolbarFromArea(area) {
   const italicBtn = document.getElementById("formatItalicBtn");
   const underlineBtn = document.getElementById("formatUnderlineBtn");
   const strikeBtn = document.getElementById("formatStrikeBtn");
+  syncTextAreaVisualFromDatasetFont(area);
   const isBold = area.style.fontWeight === "bold";
   const isItalic = area.style.fontStyle === "italic";
   const u = area.style.textDecoration || "";
@@ -797,14 +842,14 @@ async function promptUnlockUntilSuccess(fileId) {
   return true;
 }
 
-/** Thumbnail / title: open Preview (page images), not the editor. */
+/** Thumbnail / title: open read-only page images, not the editor. */
 async function openPreviewFromHome(file) {
   if (!file?.id) {
     showCustomAlert("Demo", "Upload a real PDF first.", false);
     return;
   }
   loadingOverlay.classList.remove("hidden");
-  uploadStatus.textContent = "Loading preview...";
+  uploadStatus.textContent = "Loading…";
   try {
     let res = await fetch(`/analyze/${file.id}`);
     if (res.status === 401) {
@@ -817,7 +862,7 @@ async function openPreviewFromHome(file) {
       }
     }
     if (!res.ok) {
-      let msg = "Could not load preview.";
+      let msg = "Could not load document.";
       try {
         const j = await res.json();
         if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
@@ -828,6 +873,7 @@ async function openPreviewFromHome(file) {
     }
     const json = await res.json();
     const pages = json.pages || [];
+    document.getElementById("upload-result-view")?.classList.remove("active");
     const previewView = document.getElementById("preview-view");
     const previewContainer = document.getElementById("preview-container");
     if (!previewView || !previewContainer) return;
@@ -837,8 +883,8 @@ async function openPreviewFromHome(file) {
       img.src = `/preview/${file.id}/${p.page}?v=${Date.now()}`;
       img.style.width = "100%";
       img.style.marginBottom = "16px";
-      img.style.boxShadow = "0 2px 6px rgba(0,0,0,0.15)";
-      img.style.backgroundColor = "white";
+      img.style.boxShadow = "0 1px 2px rgba(0,0,0,0.06)";
+      img.style.backgroundColor = "transparent";
       img.alt = `Page ${p.page}`;
       previewContainer.appendChild(img);
     });
@@ -868,10 +914,34 @@ async function openPreviewFromHome(file) {
       });
     }
   } catch (e) {
-    showCustomAlert("Preview failed", e.message || String(e), false);
+    showCustomAlert("Could not open document", e.message || String(e), false);
   } finally {
     loadingOverlay.classList.add("hidden");
   }
+}
+
+/** After upload: show page images + actions (editor opens only from Edit text). */
+function showUploadResultScreen(file) {
+  const uploadResultView = document.getElementById("upload-result-view");
+  const container = document.getElementById("upload-result-preview-container");
+  if (!uploadResultView || !container) return;
+  container.innerHTML = "";
+  (pagesMeta || []).forEach((p) => {
+    const img = document.createElement("img");
+    img.src = `/preview/${file.id}/${p.page}?v=${Date.now()}`;
+    img.style.width = "100%";
+    img.style.marginBottom = "16px";
+    img.style.boxShadow = "0 1px 2px rgba(0,0,0,0.06)";
+    img.style.backgroundColor = "transparent";
+    img.alt = `Page ${p.page}`;
+    container.appendChild(img);
+  });
+  const titleEl = document.getElementById("upload-result-title");
+  if (titleEl) titleEl.textContent = file.title || "Document";
+  homeView.classList.remove("active");
+  editorView.classList.remove("active");
+  document.getElementById("preview-view")?.classList.remove("active");
+  uploadResultView.classList.add("active");
 }
 
 function renderMockFiles() {
@@ -1034,10 +1104,10 @@ function renderMockFiles() {
     titleEl?.addEventListener("click", openPreviewFromThumbOrTitle);
     thumbEl?.setAttribute("role", "button");
     thumbEl?.setAttribute("tabindex", "0");
-    thumbEl?.setAttribute("aria-label", "Preview");
+    thumbEl?.setAttribute("aria-label", "View document");
     titleEl?.setAttribute("role", "button");
     titleEl?.setAttribute("tabindex", "0");
-    titleEl?.setAttribute("aria-label", "Preview");
+    titleEl?.setAttribute("aria-label", "View document");
     const keyOpen = (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
@@ -1058,7 +1128,69 @@ const shareSheetOverlay = document.getElementById("shareSheetOverlay");
 const sharingLinkSheetOverlay = document.getElementById("sharingLinkSheetOverlay");
 const moreOptionsSheetOverlay = document.getElementById("moreOptionsSheetOverlay");
 
+function wireUploadResultScreenActions() {
+  document.getElementById("upload-result-back-btn")?.addEventListener("click", () => {
+    document.getElementById("upload-result-view")?.classList.remove("active");
+    homeView.classList.add("active");
+  });
+
+  document.getElementById("upload-result-edit-btn")?.addEventListener("click", async () => {
+    if (!currentFileId) return;
+    loadingOverlay.classList.remove("hidden");
+    uploadStatus.textContent = "Loading…";
+    try {
+      await renderEditor(pagesMeta, originalItems);
+      document.getElementById("upload-result-view")?.classList.remove("active");
+      editorView.classList.add("active");
+      initEditorHistory();
+    } catch (e) {
+      alert(e.message || String(e));
+    } finally {
+      loadingOverlay.classList.add("hidden");
+    }
+  });
+
+  document.getElementById("upload-result-preview-btn")?.addEventListener("click", () => {
+    const f = mockFiles.find((x) => x.id === currentFileId);
+    if (!f?.id) return;
+    void openPreviewFromHome(f);
+  });
+
+  document.getElementById("upload-result-download-btn")?.addEventListener("click", () => {
+    if (!currentFileId) return;
+    downloadPdfByFileId(currentFileId, getDownloadFilenameForFileId(currentFileId));
+  });
+
+  document.getElementById("upload-result-share-btn")?.addEventListener("click", () => {
+    const f = mockFiles.find((x) => x.id === currentFileId);
+    if (!f?.id) return;
+    shareContextFile = f;
+    updateShareSheetUI();
+    shareSheetOverlay?.classList.remove("hidden");
+  });
+
+  document.getElementById("upload-result-more-btn")?.addEventListener("click", () => {
+    const f = mockFiles.find((x) => x.id === currentFileId);
+    if (!f?.id) return;
+    selectedMoreFile = { fileObj: f, cardEl: null };
+    const thumb = document.getElementById("moreOptionsThumb");
+    if (thumb) thumb.style.backgroundImage = f.thumb ? `url('${f.thumb}')` : "none";
+    const moTitle = document.getElementById("moreOptionsTitle");
+    if (moTitle) moTitle.textContent = f.title;
+    const formatSize = (bytes) => {
+      if (!bytes) return "323.2 KB";
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+      return (bytes / 1048576).toFixed(1) + " MB";
+    };
+    const metaEl = document.getElementById("moreOptionsMeta");
+    if (metaEl) metaEl.innerHTML = `<i class="fa-solid fa-user"></i> ${f.date || "—"} &bull; ${formatSize(f.size)}`;
+    moreOptionsSheetOverlay?.classList.remove("hidden");
+  });
+}
+
 wireShareSheetActions();
+wireUploadResultScreenActions();
 
 sharingLinkSheetOverlay?.addEventListener("click", (e) => {
   if (e.target === sharingLinkSheetOverlay) sharingLinkSheetOverlay.classList.add("hidden");
@@ -1231,7 +1363,7 @@ document.getElementById('renameOptionBtn')?.addEventListener('click', async () =
         const cleanName = newName.trim();
         const titleText = cleanName + (cleanName.toLowerCase().endsWith('.pdf') ? '' : '.pdf');
         selectedMoreFile.fileObj.title = titleText;
-        const titleEl = selectedMoreFile.cardEl.querySelector('.fc-title');
+        const titleEl = selectedMoreFile.cardEl?.querySelector('.fc-title');
         if (titleEl) titleEl.textContent = titleText;
         if (shareContextFile && shareContextFile.id === selectedMoreFile.fileObj.id) {
           shareContextFile.title = titleText;
@@ -1926,25 +2058,21 @@ pdfFile.addEventListener("change", async (e) => {
     const dd = String(today.getDate()).padStart(2, '0');
     const yy = String(today.getFullYear()).slice(-2);
     
-    mockFiles.unshift({
+    const uploadedFile = {
       id: currentFileId,
       title: files.length > 1 ? `Combined (${files.length} images)` : firstFile.name,
       size: totalSize,
       date: `${dd}/${mm}/${yy}`,
       thumb: `/preview/${currentFileId}/1?v=${Date.now()}`
-    });
+    };
+    mockFiles.unshift(uploadedFile);
     renderMockFiles();
     
-    // Store original text state
+    // Store original text state (editor opens only when user taps Edit text)
     originalItems = analyzeJson.items || [];
     pagesMeta = analyzeJson.pages || [];
     
-    // Prepare editor view
-    await renderEditor(pagesMeta, originalItems);
-    
-    homeView.classList.remove("active");
-    editorView.classList.add("active");
-    initEditorHistory();
+    showUploadResultScreen(uploadedFile);
 
   } catch (err) {
     alert(err.message);
@@ -1953,6 +2081,31 @@ pdfFile.addEventListener("change", async (e) => {
     pdfFile.value = ''; // Reset input to allow re-uploading the same file
   }
 });
+
+/**
+ * Auto-widen each OCR block to the right (PDF points) so typing wraps less; x0 unchanged.
+ * Capped: min(32% of width, 40pt, space to page edge) so tables rarely eat the next column.
+ * `delta` is applied to originalBbox x1 too so redact + insert stay aligned.
+ */
+function autoExtendBlockRightPt(x0, y0, x1, y1, pageWidthPt) {
+  const x0n = Number(x0);
+  const y0n = Number(y0);
+  const x1n = Number(x1);
+  const y1n = Number(y1);
+  const w = x1n - x0n;
+  if (!Number.isFinite(w) || w <= 0 || !Number.isFinite(pageWidthPt) || pageWidthPt <= 0) {
+    return { x0: x0n, y0: y0n, x1: x1n, y1: y1n, delta: 0 };
+  }
+  const margin = 4;
+  const room = pageWidthPt - x1n - margin;
+  if (!Number.isFinite(room) || room <= 0) return { x0: x0n, y0: y0n, x1: x1n, y1: y1n, delta: 0 };
+  const extra = Math.min(w * 0.32, 40, room);
+  if (extra < 0.5) return { x0: x0n, y0: y0n, x1: x1n, y1: y1n, delta: 0 };
+  const nx1 = Math.min(x1n + extra, pageWidthPt - margin);
+  const delta = nx1 - x1n;
+  if (delta < 0.5) return { x0: x0n, y0: y0n, x1: x1n, y1: y1n, delta: 0 };
+  return { x0: x0n, y0: y0n, x1: nx1, y1: y1n, delta };
+}
 
 // Render the editor content dynamically as an overlay on the PDF image
 async function renderEditor(pages, items) {
@@ -1972,6 +2125,7 @@ async function renderEditor(pages, items) {
     itemsByPage.get(item.page).push(item);
   }
 
+  const previewBust = Date.now();
   for (const page of pages) {
     const pageWrapper = document.createElement("div");
     pageWrapper.className = "page-wrapper";
@@ -1982,7 +2136,7 @@ async function renderEditor(pages, items) {
 
     const img = document.createElement("img");
     img.className = "page-image";
-    img.src = `/preview/${currentFileId}/${page.page}`;
+    img.src = `/preview/${currentFileId}/${page.page}?source=input&t=${previewBust}`;
     img.alt = `Page ${page.page}`;
 
     const overlay = document.createElement("div");
@@ -1999,10 +2153,28 @@ async function renderEditor(pages, items) {
 
     const pageItems = itemsByPage.get(page.page) || [];
     for (const item of pageItems) {
-      const [x0, y0, x1, y1] = item.bbox;
+      const [bx0, by0, bx1, by1] = item.bbox;
+      const ext = autoExtendBlockRightPt(bx0, by0, bx1, by1, page.width);
+      const x0 = ext.x0;
+      const y0 = ext.y0;
+      const x1 = ext.x1;
+      const y1 = ext.y1;
+      const widenDelta = ext.delta;
+
+      let ob = item.original_bbox;
+      if (!Array.isArray(ob) || ob.length !== 4) ob = item.bbox;
+      const ox0 = Number(ob[0]);
+      const oy0 = Number(ob[1]);
+      let ox1 = Number(ob[2]);
+      const oy1 = Number(ob[3]);
+      if (widenDelta > 0) {
+        ox1 = Math.min(ox1 + widenDelta, page.width - 4);
+      }
+      const originalBboxJson = JSON.stringify([ox0, oy0, ox1, oy1]);
+
       const left = (x0 / page.width) * 100;
       const top = (y0 / page.height) * 100;
-      const width = Math.max(((x1 - x0) / page.width) * 100, 1) + 2; 
+      const width = Math.max(((x1 - x0) / page.width) * 100, 1) + 2;
       const height = Math.max(((y1 - y0) / page.height) * 100, 1) + 1;
 
       // Create interactive wrapper box
@@ -2019,17 +2191,17 @@ async function renderEditor(pages, items) {
       area.dataset.originalText = item.text;
       area.dataset.id = item.id;
       area.dataset.page = String(item.page);
-      area.dataset.originalBbox = JSON.stringify(item.original_bbox ?? item.bbox);
-      area.dataset.bbox = JSON.stringify(item.bbox);
+      area.dataset.originalBbox = originalBboxJson;
+      area.dataset.bbox = JSON.stringify([x0, y0, x1, y1]);
       area.dataset.x0 = String(x0);
       area.dataset.y0 = String(y0);
       area.dataset.x1 = String(x1);
       area.dataset.y1 = String(y1);
       area.dataset.font = item.font || "helv";
       area.dataset.size = String(item.size || 11);
-
       area.style.fontFamily = mapFont(item.font);
-      area.style.lineHeight = "1.1";
+      syncTextAreaVisualFromDatasetFont(area);
+      area.style.lineHeight = "1.65";
 
       boxWrapper.appendChild(area);
 
@@ -2047,6 +2219,7 @@ async function renderEditor(pages, items) {
         
         let isDragging = false;
         let startX, startY, startW, startH, startL, startT;
+        let moveOriginCover = null;
 
         const startDrag = (e) => {
             isDragging = true;
@@ -2063,6 +2236,7 @@ async function renderEditor(pages, items) {
             startH = boxWrapper.offsetHeight;
             startL = boxWrapper.offsetLeft;
             startT = boxWrapper.offsetTop;
+            moveOriginCover = null;
             
             let currentScale = 1;
             const match = stage.style.transform.match(/scale\(([^)]+)\)/);
@@ -2094,6 +2268,18 @@ async function renderEditor(pages, items) {
                 boxWrapper.style.left = `${newL}px`;
                 boxWrapper.style.top = `${newT}px`;
 
+                moveOriginCover = ensurePdfMoveOriginCover(
+                  boxWrapper,
+                  corner,
+                  moveOriginCover,
+                  startL,
+                  startT,
+                  startW,
+                  startH,
+                  newL,
+                  newT
+                );
+
                 // Calculate back to PDF points
                 const stageRectInner = stage.getBoundingClientRect();
                 const pxPerPoint = (stageRectInner.height / currentScale) / page.height; 
@@ -2112,6 +2298,14 @@ async function renderEditor(pages, items) {
 
             const stopDrag = () => {
                 isDragging = false;
+                if (moveOriginCover) {
+                  const nl = parseFloat(String(boxWrapper.style.left)) || 0;
+                  const nt = parseFloat(String(boxWrapper.style.top)) || 0;
+                  if (Math.abs(nl - startL) < 3 && Math.abs(nt - startT) < 3) {
+                    moveOriginCover.remove();
+                  }
+                  moveOriginCover = null;
+                }
                 document.removeEventListener('mousemove', onDrag);
                 document.removeEventListener('touchmove', onDrag);
                 document.removeEventListener('mouseup', stopDrag);
@@ -2162,6 +2356,7 @@ async function renderEditor(pages, items) {
         setTimeout(() => {
            if(document.activeElement !== area) {
                boxWrapper.classList.remove('active');
+               syncPdfBoxEditedClassFromState(area);
            }
         }, 150); 
         
@@ -2195,22 +2390,15 @@ async function renderEditor(pages, items) {
       // Since it runs once initially without scale, stageRect is accurate unscaled size
       const pxPerPoint = stageRect.height / page.height;
 
-      function pxPerPointLive() {
-        const m = stage.style.transform.match(/scale\(([^)]+)\)/);
-        const sc = m ? parseFloat(m[1]) : 1;
-        const sr = stage.getBoundingClientRect();
-        return (sr.height / sc) / page.height;
-      }
-      
       for (const obj of boxWrappers) {
         const area = obj.area;
         const box = obj.box;
         
         const sz = Number(area.dataset.size || 11);
         let fontPx = sz * pxPerPoint;
-        const linePx = fontPx * 1.1;
         area.style.fontSize = `${fontPx}px`;
-        area.style.lineHeight = `${linePx}px`;
+        /* Unitless line-height scales with font-size; fixed px*1.38 still overlapped lines on Enter in some cases */
+        area.style.lineHeight = "1.65";
 
         const x0 = Number(area.dataset.x0);
         const y0 = Number(area.dataset.y0);
@@ -2220,7 +2408,7 @@ async function renderEditor(pages, items) {
         const leftPx = x0 * pxPerPoint;
         const topPx = y0 * pxPerPoint;
         const baseWidthPx = (x1 - x0) * pxPerPoint + 10;
-        const baseHeightPx = Math.max((y1 - y0) * pxPerPoint, fontPx * 1.2);
+        const baseHeightPx = Math.max((y1 - y0) * pxPerPoint, fontPx * 1.65);
 
         box.style.left = `${leftPx}px`;
         box.style.top = `${topPx}px`;
@@ -2228,21 +2416,7 @@ async function renderEditor(pages, items) {
         box.style.height = `${baseHeightPx}px`;
 
         area.addEventListener("input", () => {
-           // Toggle edited state class for white background (hiding original PDF text behind it)
-           if (area.value !== area.dataset.originalText) {
-               box.classList.add('edited');
-           } else {
-               box.classList.remove('edited');
-           }
-
-           const currentH = parseFloat(box.style.height);
-           if (area.scrollHeight > currentH) {
-               box.style.height = `${area.scrollHeight}px`;
-               const ppp = pxPerPointLive();
-               const ptY1 = Number(area.dataset.y0) + (area.scrollHeight / ppp);
-               area.dataset.bbox = JSON.stringify([Number(area.dataset.x0), Number(area.dataset.y0), Number(area.dataset.x1), ptY1]);
-               area.dataset.y1 = ptY1;
-           }
+          syncPdfBoxEditedClassFromState(area);
         });
       }
     });
@@ -2253,7 +2427,10 @@ async function renderEditor(pages, items) {
               w.classList.remove('active');
               w.classList.remove('block-selected');
             });
-            document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => a.removeAttribute('readonly'));
+            document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => {
+              a.removeAttribute('readonly');
+              syncPdfBoxEditedClassFromState(a);
+            });
             hidePdfBlockFloatMenu();
         }
     });
@@ -2263,7 +2440,10 @@ async function renderEditor(pages, items) {
               w.classList.remove('active');
               w.classList.remove('block-selected');
             });
-            document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => a.removeAttribute('readonly'));
+            document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => {
+              a.removeAttribute('readonly');
+              syncPdfBoxEditedClassFromState(a);
+            });
             hidePdfBlockFloatMenu();
         }
     }, {passive: true});
@@ -2301,7 +2481,8 @@ async function renderEditor(pages, items) {
     const height = (ph / pageHeight) * 100;
 
     const boxWrapper = document.createElement("div");
-    boxWrapper.className = "pdf-box-wrapper active";
+    boxWrapper.className =
+      "pdf-box-wrapper active inserted-from-toolbar allow-move-while-active";
     boxWrapper.style.left = `${left}%`;
     boxWrapper.style.top = `${top}%`;
     boxWrapper.style.width = `${width}%`;
@@ -2325,7 +2506,8 @@ async function renderEditor(pages, items) {
     area.dataset.align = "left";
     area.style.color = "#000000";
     area.style.fontFamily = 'sans-serif';
-    area.style.lineHeight = "1.1";
+    area.style.lineHeight = "1.65";
+    syncTextAreaVisualFromDatasetFont(area);
 
     boxWrapper.appendChild(area);
 
@@ -2342,6 +2524,7 @@ async function renderEditor(pages, items) {
       
       let isDragging = false;
       let startX, startY, startW, startH, startL, startT;
+      let moveOriginCover = null;
 
       const startDrag = (e) => {
           isDragging = true;
@@ -2354,6 +2537,7 @@ async function renderEditor(pages, items) {
           startH = boxWrapper.offsetHeight;
           startL = boxWrapper.offsetLeft;
           startT = boxWrapper.offsetTop;
+          moveOriginCover = null;
           
           let currentScale = 1;
           const match = stage.style.transform.match(/scale\(([^)]+)\)/);
@@ -2382,6 +2566,18 @@ async function renderEditor(pages, items) {
               boxWrapper.style.left = `${newL}px`;
               boxWrapper.style.top = `${newT}px`;
 
+              moveOriginCover = ensurePdfMoveOriginCover(
+                boxWrapper,
+                corner,
+                moveOriginCover,
+                startL,
+                startT,
+                startW,
+                startH,
+                newL,
+                newT
+              );
+
               const stageRectInner = stage.getBoundingClientRect();
               const pxPerPoint = (stageRectInner.height / currentScale) / pageHeight; 
               const ptX0 = newL / pxPerPoint;
@@ -2394,6 +2590,14 @@ async function renderEditor(pages, items) {
 
           const stopDrag = () => {
               isDragging = false;
+              if (moveOriginCover) {
+                const nl = parseFloat(String(boxWrapper.style.left)) || 0;
+                const nt = parseFloat(String(boxWrapper.style.top)) || 0;
+                if (Math.abs(nl - startL) < 3 && Math.abs(nt - startT) < 3) {
+                  moveOriginCover.remove();
+                }
+                moveOriginCover = null;
+              }
               document.removeEventListener('mousemove', onDrag);
               document.removeEventListener('touchmove', onDrag);
               document.removeEventListener('mouseup', stopDrag);
@@ -2433,6 +2637,17 @@ async function renderEditor(pages, items) {
       area.removeAttribute('readonly');
       syncFormattingToolbarFromArea(area);
       applyZoomToBoxContext(boxWrapper);
+      if (boxWrapper.classList.contains("inserted-from-toolbar") && area.value.trim() === "") {
+        boxWrapper.classList.add("allow-move-while-active");
+      }
+    });
+
+    area.addEventListener("input", () => {
+      syncPdfBoxEditedClassFromState(area);
+      if (boxWrapper.classList.contains("inserted-from-toolbar")) {
+        if (area.value.trim() === "") boxWrapper.classList.add("allow-move-while-active");
+        else boxWrapper.classList.remove("allow-move-while-active");
+      }
     });
     
     area.addEventListener("blur", (e) => {
@@ -2444,6 +2659,7 @@ async function renderEditor(pages, items) {
       setTimeout(() => {
          if(document.activeElement !== area) {
              boxWrapper.classList.remove('active');
+             syncPdfBoxEditedClassFromState(area);
          }
       }, 150); 
       
@@ -2501,7 +2717,7 @@ async function renderEditor(pages, items) {
       const currentPx = parseFloat(lastActiveArea.style.fontSize) || 11;
       const ratio = newSize / currentSize;
       lastActiveArea.style.fontSize = `${currentPx * ratio}px`;
-      lastActiveArea.style.lineHeight = `${(currentPx * ratio) * 1.1}px`;
+      lastActiveArea.style.lineHeight = "1.65";
   });
 
   document.getElementById("formatBoldBtn")?.addEventListener("click", () => {
@@ -2564,6 +2780,7 @@ async function renderEditor(pages, items) {
       if (f.includes("italic")) base += "-italic";
       
       lastActiveArea.dataset.font = base;
+      syncTextAreaVisualFromDatasetFont(lastActiveArea);
       if (base.includes("times")) lastActiveArea.style.fontFamily = '"Times New Roman", Times, serif';
       else if (base.includes("courier")) lastActiveArea.style.fontFamily = '"Courier New", Courier, monospace';
       else lastActiveArea.style.fontFamily = 'sans-serif';
@@ -2604,6 +2821,7 @@ async function renderEditor(pages, items) {
     });
     document.querySelectorAll(".pdf-text-input").forEach((a) => a.removeAttribute("readonly"));
     editorView.classList.remove("active");
+    document.getElementById("upload-result-view")?.classList.remove("active");
     homeView.classList.add("active");
   });
 
@@ -2631,6 +2849,35 @@ function normalizeEditorLayoutForSave() {
   if (ae && ae.classList && ae.classList.contains("pdf-text-input")) {
     ae.blur();
   }
+}
+
+/** True if user moved/resized the box vs analyze (so save must include this item even when text unchanged). */
+function bboxDiffersMeaningfullyFromOriginal(area) {
+  try {
+    const b = JSON.parse(area.dataset.bbox || "[]");
+    const ob = JSON.parse(area.dataset.originalBbox || area.dataset.bbox || "[]");
+    if (!Array.isArray(b) || b.length !== 4 || !Array.isArray(ob) || ob.length !== 4) return false;
+    const tol = 3;
+    for (let i = 0; i < 4; i++) {
+      if (Math.abs(Number(b[i]) - Number(ob[i])) > tol) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** .edited = white fill + visible textarea; needed after blur if only move/format changed (text reverted to original). */
+function syncPdfBoxEditedClassFromState(area) {
+  const box = area?.closest(".pdf-box-wrapper");
+  if (!box || !area) return;
+  const norm = (s) => String(s || "").replace(/\r\n/g, "\n");
+  const textChanged = norm(area.value) !== norm(area.dataset.originalText || "");
+  const needPaint =
+    textChanged ||
+    area.dataset.wasFormatted === "1" ||
+    bboxDiffersMeaningfullyFromOriginal(area);
+  box.classList.toggle("edited", needPaint);
 }
 
 /** Recompute dataset bbox from box positions (PDF points) after zoom is 1 — fixes mobile edit drift. */
@@ -2682,10 +2929,14 @@ saveBtn.addEventListener("click", async () => {
   const edits = textAreas
     .filter((area) => {
       if (!area) return false;
-      // Include if text changed OR if any formatting was applied
+      // Include if text changed OR formatting OR box moved/resized (otherwise save skipped → preview stays at old place)
       const original = normalize(area.dataset.originalText).trim();
       const current = normalize(area.value).trim();
-      return current !== original || area.dataset.wasFormatted === '1';
+      return (
+        current !== original ||
+        area.dataset.wasFormatted === '1' ||
+        bboxDiffersMeaningfullyFromOriginal(area)
+      );
     })
     .map((area) => ({
       id: area.dataset.id,
@@ -2702,7 +2953,7 @@ saveBtn.addEventListener("click", async () => {
     }));
 
   loadingOverlay.classList.remove("hidden");
-  uploadStatus.textContent = `Applying edits (Detected ${edits.length} changes)...`;
+  uploadStatus.textContent = "Saving…";
 
   try {
     const res = await fetch("/edit", {
@@ -2713,11 +2964,20 @@ saveBtn.addEventListener("click", async () => {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || "Server failed to save edits.");
+      const msg =
+        formatServerDetail(err.detail) || "Server failed to save edits.";
+      throw new Error(msg);
     }
 
     const { download_url } = await res.json();
-    
+
+    const listIdx = mockFiles.findIndex((f) => f.id === currentFileId);
+    if (listIdx > -1) {
+      mockFiles[listIdx].thumb = `/preview/${currentFileId}/1?v=${Date.now()}`;
+      persistRecentFiles();
+      renderMockFiles();
+    }
+
     // Setup and show preview view instead of downloading immediately
     const previewView = document.getElementById("preview-view");
     const previewContainer = document.getElementById("preview-container");
@@ -2729,8 +2989,8 @@ saveBtn.addEventListener("click", async () => {
         img.src = `/preview_edited/${currentFileId}/${p.page}?_t=${Date.now()}`;
         img.style.width = "100%";
         img.style.marginBottom = "16px";
-        img.style.boxShadow = "0 2px 6px rgba(0,0,0,0.15)";
-        img.style.backgroundColor = "white";
+        img.style.boxShadow = "0 1px 2px rgba(0,0,0,0.06)";
+        img.style.backgroundColor = "transparent";
         previewContainer.appendChild(img);
     });
     
@@ -3814,3 +4074,28 @@ document.getElementById("signPkcs12Btn")?.addEventListener("click", () => {
     }
   );
 });
+
+window.pdfEditorAppBridge = {
+  getSelectedMoreFile: () => selectedMoreFile,
+  hideMoreOptions: () => moreOptionsSheetOverlay?.classList.add("hidden"),
+  setBusy: (message) => {
+    loadingOverlay.classList.remove("hidden");
+    uploadStatus.textContent = message || "Loading…";
+  },
+  clearBusy: () => {
+    loadingOverlay.classList.add("hidden");
+  },
+  showAlert: showCustomAlert,
+  showHome: () => {
+    document.querySelectorAll(".view").forEach((el) => el.classList.remove("active"));
+    homeView.classList.add("active");
+  },
+  refreshFiles: () => {
+    renderMockFiles();
+    persistRecentFiles();
+  },
+  setFileThumb: (fileId, thumb) => {
+    const file = mockFiles.find((f) => f.id === fileId);
+    if (file) file.thumb = thumb;
+  },
+};

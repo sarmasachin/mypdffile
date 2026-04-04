@@ -16,6 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from api.image_edit_tool import create_image_edit_router
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -42,6 +43,7 @@ app = FastAPI(title="PDF Editor Tool")
 # Behind Render / other reverse proxies so request.url_for / schemes stay correct.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.include_router(create_image_edit_router(BASE_DIR, WORK_DIR))
 
 
 class EditItem(BaseModel):
@@ -154,8 +156,18 @@ def output_path(file_id: str) -> Path:
 def preview_path(file_id: str, page_number: int) -> Path:
     return WORK_DIR / file_id / f"preview-{page_number}.png"
 
+
+def preview_input_path(file_id: str, page_number: int) -> Path:
+    """Editor overlay: always from input.pdf so bboxes match /analyze (never edited.pdf)."""
+    return WORK_DIR / file_id / f"preview_input-{page_number}.png"
+
+
 def preview_edited_path(file_id: str, page_number: int) -> Path:
     return WORK_DIR / file_id / f"preview_edited-{page_number}.png"
+
+
+# /preview aur /preview_edited dono isi scale par — warna save ke baad alag zoom se "dusri image" jaisa lage.
+_PREVIEW_MATRIX = fitz.Matrix(2, 2)
 
 
 def _preview_png_stale(png: Path, pdf: Path) -> bool:
@@ -168,6 +180,20 @@ def _preview_png_stale(png: Path, pdf: Path) -> bool:
         return pdf.stat().st_mtime > png.stat().st_mtime
     except OSError:
         return True
+
+
+def _write_workspace_page_previews(file_id: str, doc: fitz.Document) -> None:
+    """After save: refresh preview-*.png and preview_edited-*.png so home + post-save preview match edited.pdf."""
+    out_pdf = output_path(file_id)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    for pg_num in range(1, doc.page_count + 1):
+        page = doc[pg_num - 1]
+        pix = page.get_pixmap(matrix=_PREVIEW_MATRIX, alpha=False)
+        pix.save(str(preview_edited_path(file_id, pg_num)))
+        pix.save(str(preview_path(file_id, pg_num)))
+
+
+_PREVIEW_CACHE_HEADERS = {"Cache-Control": "no-store, max-age=0"}
 
 
 def fitz_open_workspace_pdf(path: str | Path) -> fitz.Document:
@@ -459,8 +485,6 @@ def _insert_textbox_fit(
     color_hex: str = "#000000",
     align: str = "left",
 ) -> None:
-    import copy
-    
     # Parse hex color safely
     color_hex = color_hex.lstrip("#")
     if len(color_hex) == 6:
@@ -475,8 +499,10 @@ def _insert_textbox_fit(
     else:
         align_code = fitz.TEXT_ALIGN_LEFT
 
-    expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1 + 400, rect.y1 + 400)
-    
+    # Do not extend x1: +400 made the layout box almost full-line wide so wrapped lines broke
+    # at wrong places vs the table column (preview looked "left" / jagged vs Description header).
+    expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y1 + 400)
+
     page.insert_textbox(
         expanded_rect,
         text,
@@ -485,6 +511,61 @@ def _insert_textbox_fit(
         color=(r, g, b),
         align=align_code,
     )
+
+
+# PyMuPDF short names sometimes fail on specific PDFs; try PDF standard names before dropping bold.
+_FITZ_FONT_FALLBACKS: dict[str, list[str]] = {
+    "hebo": ["Helvetica-Bold"],
+    "hebi": ["Helvetica-BoldOblique"],
+    "heit": ["Helvetica-Oblique"],
+    "tibo": ["Times-Bold"],
+    "tibi": ["Times-BoldItalic"],
+    "tiit": ["Times-Italic"],
+    "cobo": ["Courier-Bold"],
+    "cobi": ["Courier-BoldOblique"],
+    "coit": ["Courier-Oblique"],
+}
+
+
+def _insert_textbox_fit_try_font_chain(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    mapped_font: str,
+    start_size: float,
+    color_hex: str,
+    align: str,
+) -> None:
+    seen: set[str] = set()
+    chain = [mapped_font] + _FITZ_FONT_FALLBACKS.get(mapped_font, [])
+    chain.append("helv")
+    last_err: Exception | None = None
+    for fn in chain:
+        if fn in seen:
+            continue
+        seen.add(fn)
+        try:
+            _insert_textbox_fit(page, rect, text, fn, start_size, color_hex, align)
+            return
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+
+
+def _min_insert_width_pt(edit: EditItem) -> float:
+    """Minimum box width so insert_textbox does not wrap one glyph per line (table/unify bug)."""
+    fs = float(edit.size or 11)
+    t = (edit.text or "").replace("\r\n", "\n")
+    lines = [ln for ln in t.split("\n") if ln.strip()] or [t or " "]
+    max_len = max(len(ln) for ln in lines)
+    est = max_len * fs * 0.52
+    return max(fs * 3.0, min(est, 520.0))
+
+
+# Invoice/table: many rows share similar x0/x1; paragraph-unify must not merge them all.
+_MAX_LINES_UNIFY_AS_ONE_PARAGRAPH = 12
 
 
 def _map_font_for_fitz(font_name: str | None) -> str:
@@ -511,6 +592,179 @@ def _map_font_for_fitz(font_name: str | None) -> str:
     if is_bold: return "hebo"
     if is_italic: return "heit"
     return "helv"
+
+
+def _bbox_list_finite(b: list[float] | None) -> bool:
+    if not b or len(b) != 4:
+        return False
+    try:
+        return all(math.isfinite(float(x)) for x in b)
+    except (TypeError, ValueError):
+        return False
+
+
+def _clip_rect_to_page(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect | None:
+    """Intersect with page mediabox; None if rect is invalid or unusable (avoids PyMuPDF errors)."""
+    try:
+        for v in (rect.x0, rect.y0, rect.x1, rect.y1):
+            if not math.isfinite(float(v)):
+                return None
+        if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+            return None
+        clipped = rect & page.rect
+        if clipped.is_empty or clipped.width < 0.5 or clipped.height < 0.5:
+            return None
+        return clipped
+    except Exception:
+        return None
+
+
+def _median_int(vals: list[int]) -> int:
+    if not vals:
+        return 255
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) // 2
+
+
+def _median_rgb01(samples: list[tuple[int, int, int]]) -> tuple[float, float, float]:
+    if not samples:
+        return (1.0, 1.0, 1.0)
+    r = _median_int([p[0] for p in samples])
+    g = _median_int([p[1] for p in samples])
+    b = _median_int([p[2] for p in samples])
+    return (
+        min(1.0, max(0.0, r / 255.0)),
+        min(1.0, max(0.0, g / 255.0)),
+        min(1.0, max(0.0, b / 255.0)),
+    )
+
+
+def _dist_to_inner_rect_px(x: int, y: int, ix0: int, iy0: int, ix1: int, iy1: int) -> float:
+    """Half-open rect [ix0, ix1) x [iy0, iy1) in pixel space; 0 if inside."""
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 1e9
+    cx = max(ix0, min(x, ix1 - 1))
+    cy = max(iy0, min(y, iy1 - 1))
+    return math.hypot(float(x - cx), float(y - cy))
+
+
+def _robust_background_rgb01(samples: list[tuple[int, int, int]]) -> tuple[float, float, float]:
+    """
+    Pehle per-channel median, phir usse bahut alag pixels hatao (text/edge),
+    phir dubara median — mean se zyada stable, patch kam dikhta hai.
+    """
+    if not samples:
+        return (1.0, 1.0, 1.0)
+    m0 = (
+        _median_int([p[0] for p in samples]),
+        _median_int([p[1] for p in samples]),
+        _median_int([p[2] for p in samples]),
+    )
+    thresh_sq = 65 * 65
+    kept = [
+        p
+        for p in samples
+        if (p[0] - m0[0]) ** 2 + (p[1] - m0[1]) ** 2 + (p[2] - m0[2]) ** 2 <= thresh_sq
+    ]
+    if len(kept) >= max(6, len(samples) // 5):
+        return _median_rgb01(kept)
+    return _median_rgb01(samples)
+
+
+def _sample_background_fill_rgb(page: fitz.Page, inner: fitz.Rect) -> tuple[float, float, float]:
+    """
+    Redaction fill: background jaisa RGB. Poora pixmap average mat lo — design me safed
+    hissa mil kar fill phir safed ho jata hai. Sirf margin / pixmap border / corners.
+    """
+    margin_pt = 28.0
+    clip = fitz.Rect(inner)
+    clip.x0 -= margin_pt
+    clip.y0 -= margin_pt
+    clip.x1 += margin_pt
+    clip.y1 += margin_pt
+    clip &= page.rect
+    if clip.is_empty or clip.width < 2 or clip.height < 2:
+        return (1.0, 1.0, 1.0)
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=clip, alpha=False)
+    except Exception:
+        return (1.0, 1.0, 1.0)
+    if pix.width < 2 or pix.height < 2 or not pix.samples:
+        return (1.0, 1.0, 1.0)
+    n = pix.n
+    if n < 3:
+        return (1.0, 1.0, 1.0)
+    rx0 = inner.x0 - clip.x0
+    ry0 = inner.y0 - clip.y0
+    rx1 = inner.x1 - clip.x0
+    ry1 = inner.y1 - clip.y0
+    sx = pix.width / clip.width
+    sy = pix.height / clip.height
+    ix0 = int(rx0 * sx)
+    iy0 = int(ry0 * sy)
+    ix1 = int(math.ceil(rx1 * sx))
+    iy1 = int(math.ceil(ry1 * sy))
+    ix0 = max(0, min(pix.width - 1, ix0))
+    iy0 = max(0, min(pix.height - 1, iy0))
+    ix1 = max(ix0 + 1, min(pix.width, ix1))
+    iy1 = max(iy0 + 1, min(pix.height, iy1))
+    stride = pix.width * n
+    data = pix.samples
+    samples: list[tuple[int, int, int]] = []
+
+    def get_px(x: int, y: int) -> tuple[int, int, int]:
+        i = y * stride + x * n
+        return (data[i], data[i + 1], data[i + 2])
+
+    # 1) Pehle patli ring: sirf text box ke bilkul bahar ke pixels (solid red / card
+    #    jaisa rang). Poora donut se stadium / doosre panel ka rang kam aata tha.
+    w_in = ix1 - ix0
+    h_in = iy1 - iy0
+    base_ring = max(4.0, min(14.0, 0.14 * float(max(w_in, h_in, 1))))
+    samples = []
+    for widen in (1.0, 1.7, 2.4):
+        rg = base_ring * widen
+        samples = []
+        for y in range(pix.height):
+            for x in range(pix.width):
+                d = _dist_to_inner_rect_px(x, y, ix0, iy0, ix1, iy1)
+                if 0 < d <= rg:
+                    samples.append(get_px(x, y))
+        if len(samples) >= 10:
+            break
+
+    # 2) Ring se kam mila to poora donut (clip minus inner)
+    if len(samples) < 8:
+        samples = []
+        for y in range(pix.height):
+            for x in range(pix.width):
+                if ix0 <= x < ix1 and iy0 <= y < iy1:
+                    continue
+                samples.append(get_px(x, y))
+
+    # 3) Kam pixel hon to pixmap ke bahri dhari
+    if len(samples) < 8:
+        border_px = max(2, min(10, pix.width // 12, pix.height // 12))
+        samples = []
+        for y in range(pix.height):
+            for x in range(pix.width):
+                if x < border_px or x >= pix.width - border_px or y < border_px or y >= pix.height - border_px:
+                    samples.append(get_px(x, y))
+
+    # 4) Char kon
+    if len(samples) < 8:
+        csz = max(4, min(14, pix.width // 6, pix.height // 6))
+        samples = []
+        for y0, x0 in ((0, 0), (0, max(0, pix.width - csz)), (max(0, pix.height - csz), 0), (max(0, pix.height - csz), max(0, pix.width - csz))):
+            for dy in range(min(csz, pix.height - y0)):
+                for dx in range(min(csz, pix.width - x0)):
+                    samples.append(get_px(x0 + dx, y0 + dy))
+
+    return _robust_background_rgb01(samples)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -651,23 +905,39 @@ async def source_pdf(file_id: str) -> FileResponse:
 
 
 @app.get("/preview/{file_id}/{page_number}")
-async def page_preview(file_id: str, page_number: int) -> FileResponse:
-    path = resolve_pdf_path(file_id)
+async def page_preview(
+    file_id: str,
+    page_number: int,
+    source: str | None = None,
+) -> FileResponse:
+    """
+    Default: latest workspace PDF (edited if present) — thumbnails / read-only browse.
+    source=input: original upload only — must match /analyze bboxes in the text editor.
+    """
+    if (source or "").strip().lower() == "input":
+        path = ensure_file(file_id)
+        out_path = preview_input_path(file_id, page_number)
+    else:
+        path = resolve_pdf_path(file_id)
+        out_path = preview_path(file_id, page_number)
     doc = fitz.open(path)
 
     if page_number < 1 or page_number > doc.page_count:
         doc.close()
         raise HTTPException(status_code=404, detail="Page not found")
 
-    out_path = preview_path(file_id, page_number)
     if _preview_png_stale(out_path, path):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         page = doc[page_number - 1]
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        pix = page.get_pixmap(matrix=_PREVIEW_MATRIX, alpha=False)
         pix.save(str(out_path))
 
     doc.close()
-    return FileResponse(path=out_path, media_type="image/png")
+    return FileResponse(
+        path=out_path,
+        media_type="image/png",
+        headers=_PREVIEW_CACHE_HEADERS,
+    )
 
 
 @app.get("/preview_edited/{file_id}/{page_number}")
@@ -675,7 +945,11 @@ async def page_preview_edited(file_id: str, page_number: int) -> FileResponse:
     path = resolve_pdf_path(file_id)
     out_path = preview_edited_path(file_id, page_number)
     if not _preview_png_stale(out_path, path):
-        return FileResponse(path=out_path, media_type="image/png")
+        return FileResponse(
+            path=out_path,
+            media_type="image/png",
+            headers=_PREVIEW_CACHE_HEADERS,
+        )
 
     try:
         doc = fitz.open(path)
@@ -684,7 +958,7 @@ async def page_preview_edited(file_id: str, page_number: int) -> FileResponse:
             raise HTTPException(status_code=404, detail="Page not found")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         page = doc[page_number - 1]
-        pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), alpha=False)
+        pix = page.get_pixmap(matrix=_PREVIEW_MATRIX, alpha=False)
         pix.save(out_path)
         doc.close()
     except HTTPException:
@@ -692,10 +966,177 @@ async def page_preview_edited(file_id: str, page_number: int) -> FileResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview generation failed: {e}")
 
-    return FileResponse(path=out_path, media_type="image/png")
+    return FileResponse(
+        path=out_path,
+        media_type="image/png",
+        headers=_PREVIEW_CACHE_HEADERS,
+    )
+
+
+def _extract_items_from_text_dict(page_index: int, text_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build editable items from PyMuPDF text dict (vector text or OCR textpage dict)."""
+    out: list[dict[str, Any]] = []
+    for block_index, block in enumerate(text_dict.get("blocks", [])):
+        if block.get("type") != 0:
+            continue
+
+        for line_index, line in enumerate(block.get("lines", [])):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+
+            chunks: list[list[Any]] = []
+            current_chunk: list[Any] = []
+
+            for span in spans:
+                t = (span.get("text") or "").strip()
+                if not t:
+                    continue
+
+                if not current_chunk:
+                    current_chunk.append(span)
+                else:
+                    prev_span = current_chunk[-1]
+                    prev_x1 = float(prev_span.get("bbox", [0, 0, 0, 0])[2])
+                    curr_x0 = float(span.get("bbox", [0, 0, 0, 0])[0])
+                    if curr_x0 - prev_x1 > 12.0:
+                        chunks.append(current_chunk)
+                        current_chunk = [span]
+                    else:
+                        current_chunk.append(span)
+
+            if current_chunk:
+                chunks.append(current_chunk)
+
+            for chunk_index, chunk in enumerate(chunks):
+                chunk_text = " ".join(
+                    (s.get("text") or "").strip() for s in chunk if (s.get("text") or "").strip()
+                )
+                if not chunk_text:
+                    continue
+
+                rects: list[fitz.Rect] = []
+                for s in chunk:
+                    sb = s.get("bbox")
+                    if sb and len(sb) == 4:
+                        try:
+                            rects.append(fitz.Rect([float(v) for v in sb]))
+                        except Exception:
+                            pass
+
+                if not rects:
+                    continue
+
+                x0 = min(r.x0 for r in rects)
+                y0 = min(r.y0 for r in rects)
+                x1 = max(r.x1 for r in rects)
+                y1 = max(r.y1 for r in rects)
+
+                bbox_list = [float(x0), float(y0), float(x1), float(y1)]
+                item_id = f"p{page_index}-b{block_index}-l{line_index}-c{chunk_index}"
+
+                first_span = chunk[0]
+                font_name = first_span.get("font", "helv") or "helv"
+                size = float(first_span.get("size", 11.0))
+                # Span "flags" mark synthetic bold/italic even when the font name omits "Bold"/"Italic".
+                any_bold = any(
+                    int(s.get("flags", 0)) & int(fitz.TEXT_FONT_BOLD) for s in chunk
+                )
+                any_italic = any(
+                    int(s.get("flags", 0)) & int(fitz.TEXT_FONT_ITALIC) for s in chunk
+                )
+                fl = font_name.lower()
+                if any_bold and "bold" not in fl:
+                    font_name = f"{font_name}-bold"
+                    fl = font_name.lower()
+                if any_italic and "italic" not in fl and "oblique" not in fl:
+                    font_name = f"{font_name}-italic"
+
+                out.append(
+                    {
+                        "id": item_id,
+                        "page": page_index + 1,
+                        "text": chunk_text,
+                        "bbox": bbox_list,
+                        "font": font_name,
+                        "size": size,
+                    }
+                )
+    return out
+
+
+_rapid_ocr_engine: Any = None
+
+
+def _ocr_items_rapid(page: fitz.Page, page_index: int) -> list[dict[str, Any]]:
+    """Fallback OCR for scanned/photo pages (no vector text). Uses ONNX models via RapidOCR."""
+    global _rapid_ocr_engine
+    try:
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception:
+        return []
+
+    if _rapid_ocr_engine is None:
+        try:
+            _rapid_ocr_engine = RapidOCR()
+        except Exception:
+            return []
+
+    mat = fitz.Matrix(2, 2)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    h, w = pix.height, pix.width
+    if h < 2 or w < 2:
+        return []
+
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, pix.n)
+    if pix.n == 4:
+        img = img[:, :, :3]
+
+    try:
+        ocr_out, _ = _rapid_ocr_engine(img)
+    except Exception:
+        return []
+
+    if not ocr_out:
+        return []
+
+    page_w = float(page.rect.width)
+    page_h = float(page.rect.height)
+    items: list[dict[str, Any]] = []
+    for i, row in enumerate(ocr_out):
+        if not row or len(row) < 2:
+            continue
+        box, text = row[0], row[1]
+        if not text or not str(text).strip():
+            continue
+        try:
+            xs = [float(p[0]) for p in box]
+            ys = [float(p[1]) for p in box]
+        except Exception:
+            continue
+        x0 = min(xs) / float(w) * page_w
+        x1 = max(xs) / float(w) * page_w
+        y0 = min(ys) / float(h) * page_h
+        y1 = max(ys) / float(h) * page_h
+        bh = max(0.1, y1 - y0)
+        size = max(8.0, min(72.0, bh * 0.82))
+        items.append(
+            {
+                "id": f"p{page_index}-ocr-{i}",
+                "page": page_index + 1,
+                "text": str(text).strip(),
+                "bbox": [x0, y0, x1, y1],
+                "font": "helv",
+                "size": size,
+            }
+        )
+    return items
+
 
 @app.get("/analyze/{file_id}")
 async def analyze_pdf(file_id: str) -> dict[str, Any]:
+    # Always original upload — editor uses /preview?source=input; /edit applies onto this file.
     path = ensure_file(file_id)
     try:
         doc = fitz.open(path)
@@ -720,283 +1161,357 @@ async def analyze_pdf(file_id: str) -> dict[str, Any]:
         )
 
         text_dict = page.get_text("dict")
-        for block_index, block in enumerate(text_dict.get("blocks", [])):
-            if block.get("type") != 0:
-                continue
-            
-            for line_index, line in enumerate(block.get("lines", [])):
-                spans = line.get("spans", [])
-                if not spans:
-                    continue
-                
-                # Group text spans that are horizontally close into chunks.
-                # If there's a layout gap (like between a label and its value in a table),
-                # it separates them into isolated editable boxes, preserving original coordinates accurately!
-                chunks = []
-                current_chunk = []
-                
-                for span in spans:
-                    t = (span.get("text") or "").strip()
-                    if not t:
-                        continue
-                        
-                    if not current_chunk:
-                        current_chunk.append(span)
-                    else:
-                        prev_span = current_chunk[-1]
-                        prev_x1 = float(prev_span.get("bbox", [0,0,0,0])[2])
-                        curr_x0 = float(span.get("bbox", [0,0,0,0])[0])
-                        
-                        # Gap of > 12 points usually indicates a structural separation (columns, tabs)
-                        if curr_x0 - prev_x1 > 12.0:
-                            chunks.append(current_chunk)
-                            current_chunk = [span]
-                        else:
-                            current_chunk.append(span)
-                            
-                if current_chunk:
-                    chunks.append(current_chunk)
-                
-                for chunk_index, chunk in enumerate(chunks):
-                    chunk_text = " ".join((s.get("text") or "").strip() for s in chunk if (s.get("text") or "").strip())
-                    if not chunk_text:
-                        continue
-                        
-                    # Calculate strict tight bounding box for the chunk
-                    rects = []
-                    for s in chunk:
-                        sb = s.get("bbox")
-                        if sb and len(sb) == 4:
-                            try:
-                                rects.append(fitz.Rect([float(v) for v in sb]))
-                            except Exception:
-                                pass
-                                
-                    if not rects:
-                        continue
-                        
-                    x0 = min(r.x0 for r in rects)
-                    y0 = min(r.y0 for r in rects)
-                    x1 = max(r.x1 for r in rects)
-                    y1 = max(r.y1 for r in rects)
-                    
-                    bbox_list = [float(x0), float(y0), float(x1), float(y1)]
-                    item_id = f"p{page_index}-b{block_index}-l{line_index}-c{chunk_index}"
-                    
-                    first_span = chunk[0]
-                    font_name = first_span.get("font", "helv")
-                    size = float(first_span.get("size", 11.0))
-                    
-                    items.append(
-                        {
-                            "id": item_id,
-                            "page": page_index + 1,
-                            "text": chunk_text,
-                            "bbox": bbox_list,
-                            "font": font_name,
-                            "size": size,
-                        }
-                    )
+        page_items = _extract_items_from_text_dict(page_index, text_dict)
+        if not page_items:
+            try:
+                tp = page.get_textpage_ocr(full=True, dpi=150, language="eng")
+                ocr_dict = page.get_text("dict", textpage=tp)
+                page_items = _extract_items_from_text_dict(page_index, ocr_dict)
+            except Exception:
+                pass
+        if not page_items:
+            page_items = _ocr_items_rapid(page, page_index)
+        items.extend(page_items)
 
     doc.close()
     return {"file_id": file_id, "pages": pages, "items": items}
 
 
+def _unify_paragraph_left_x0_for_insert(edits: list[EditItem]) -> dict[str, float]:
+    """
+    OCR often splits one paragraph into several boxes with different bbox.x0; insert then
+    starts each box at its own left edge so line 2+ looks "outdented" vs line 1.
+
+    Group boxes that belong to the same paragraph (stacked lines in the same column, or
+    strong horizontal overlap) and use max(x0) for insert. Redaction still uses each
+    block's original bbox.
+
+    Note: If the UI sends only ONE edit for a whole cell, this returns {} — nothing to unify.
+    """
+    n = len(edits)
+    if n < 2:
+        return {}
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        pi, pj = find(i), find(j)
+        if pi != pj:
+            parent[pi] = pj
+
+    def same_cluster(a: EditItem, b: EditItem) -> bool:
+        if a.page != b.page:
+            return False
+        ax0, ay0, ax1, ay1 = a.bbox
+        bx0, by0, bx1, by1 = b.bbox
+        aw = max(0.01, ax1 - ax0)
+        bw = max(0.01, bx1 - bx0)
+        inter = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+        overlap_ratio = inter / min(aw, bw)
+        ah = max(0.01, ay1 - ay0)
+        bh = max(0.01, by1 - by0)
+
+        # Same table column: left/right edges line up (paragraph lines stacked vertically).
+        same_column = abs(ax0 - bx0) <= 24.0 and abs(ax1 - bx1) <= 24.0
+        # Vertical: stacked lines in one cell (small gap), not a full table row skip.
+        y_overlap = min(ay1, by1) - max(ay0, by0)
+        if y_overlap > 0:
+            vertically_adjacent = True
+        else:
+            gap = max(ay0, by0) - min(ay1, by1)
+            max_h = max(ah, bh)
+            vertically_adjacent = gap <= max_h * 0.55 + 3.5
+
+        if same_column and vertically_adjacent:
+            return True
+
+        # Original rule: overlapping in x and on the same "row band" (side-by-side merge).
+        if overlap_ratio < 0.22:
+            return False
+        acy = (ay0 + ay1) / 2.0
+        bcy = (by0 + by1) / 2.0
+        if abs(acy - bcy) > max(ah, bh) * 2.2:
+            return False
+        return True
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if same_cluster(edits[i], edits[j]):
+                union(i, j)
+
+    clusters: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        clusters[find(i)].append(i)
+
+    out: dict[str, float] = {}
+    for _root, idxs in clusters.items():
+        if len(idxs) < 2:
+            continue
+        if len(idxs) > _MAX_LINES_UNIFY_AS_ONE_PARAGRAPH:
+            continue
+        mx = max(edits[i].bbox[0] for i in idxs)
+        for i in idxs:
+            e = edits[i]
+            if e.bbox[0] < mx - 1e-6:
+                x1 = float(e.bbox[2])
+                if x1 - mx >= _min_insert_width_pt(e) - 1e-3:
+                    out[e.id] = mx
+    return out
+
+
 @app.post("/edit")
 async def edit_pdf(payload: EditRequest) -> dict[str, str]:
+    # Client bboxes are always in input.pdf space (matches /analyze). Rebuild edited.pdf from input each save.
     path = ensure_file(payload.file_id)
-    try:
-        doc = fitz.open(path)
-        if doc.is_encrypted:
-            doc.close()
-            raise HTTPException(status_code=401, detail="PDF is password-protected. Unlock it first.")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=401, detail="PDF is password-protected. Unlock it first.")
 
     normalized_edits = [
         item
         for item in payload.edits
         if item.text is not None
+        and _bbox_list_finite(item.bbox)
+        and (item.original_bbox is None or _bbox_list_finite(item.original_bbox))
     ]
 
     if not normalized_edits:
         shutil.copy(path, ensure_output_path(payload.file_id))
-        # Generate previews from original too
         try:
             preview_doc = fitz_open_workspace_pdf(ensure_output_path(payload.file_id))
-            for pg_num in range(1, preview_doc.page_count + 1):
-                pg = preview_doc[pg_num - 1]
-                pix = pg.get_pixmap(matrix=fitz.Matrix(4, 4), alpha=False)
-                pix.save(preview_edited_path(payload.file_id, pg_num))
+            _write_workspace_page_previews(payload.file_id, preview_doc)
             preview_doc.close()
         except Exception:
             pass
         return {"download_url": f"/download/{payload.file_id}"}
 
-    by_page: dict[int, list[EditItem]] = defaultdict(list)
-    for item in normalized_edits:
-        by_page[item.page - 1].append(item)
-
-    for page_index, edits in by_page.items():
-        if page_index < 0 or page_index >= doc.page_count:
-            continue
-        page = doc[page_index]
-
-        def _padded_rect(edit_item: EditItem, mode: str) -> fitz.Rect:
-            """
-            Text boxes ka bbox extracted tight hota hai.
-            Double text/cut se bachne ke liye redaction rect ko text insert rect se
-            thoda bada rakhte hain.
-            """
-            if mode == "redact" and edit_item.original_bbox:
-                raw = fitz.Rect(edit_item.original_bbox)
-            else:
-                raw = fitz.Rect(edit_item.bbox)
-                
-            base = float(edit_item.size or 11)
-            # Using both bbox geometry and detected font size makes padding work
-            # even when OCR/text extraction bbox is slightly off.
-            w = max(0.1, float(raw.x1 - raw.x0))
-            h = max(0.1, float(raw.y1 - raw.y0))
-
-            txt = (edit_item.text or "").strip()
-            lines = [ln for ln in txt.splitlines() if ln.strip() != ""]
-            line_count = max(1, len(lines))
-            max_line = max(lines, key=len) if lines else txt
-
-            if mode == "redact":
-                # Redaction ko minimal rakhein, bas descenders/underlines ko cover karne ke liye.
-                pad_x = max(0.6, base * 0.15, w * 0.06)
-                pad_y = max(0.6, base * 0.20, h * 0.08)
-                est_char_w = base * 0.55
-                est_line_h = base * 1.05
-                cap_x = 10.0
-                cap_y = 10.0
-                mult_x = 0.22
-                mult_y = 0.18
-            else:
-                # Insert rect ko tight rakhein (neighbor text disturb na ho).
-                pad_x = max(0.4, base * 0.10, w * 0.04)
-                pad_y = max(0.4, base * 0.14, h * 0.06)
-                est_char_w = base * 0.50
-                est_line_h = base * 1.02
-                cap_x = 7.0
-                cap_y = 7.0
-                mult_x = 0.18
-                mult_y = 0.14
-
-            est_text_w = len(max_line) * est_char_w
-            est_text_h = line_count * est_line_h
-
-            extra_x = max(0.0, (est_text_w - w) / 2.0)
-            extra_y = max(0.0, (est_text_h - h) / 2.0)
-
-            pad_x = min(pad_x + extra_x * mult_x, cap_x)
-            pad_y = min(pad_y + extra_y * mult_y, cap_y)
-
-            return fitz.Rect(raw.x0 - pad_x, raw.y0 - pad_y, raw.x1 + pad_x, raw.y1 + pad_y)
-
-        # 1) Redaction (purana text fully remove karne ke liye bada rect)
-        for edit in edits:
-            rect = _padded_rect(edit, "redact")
-            page.add_redact_annot(rect, fill=(1, 1, 1))
-
-        # Purana text/image ko redaction se remove karo,
-        # warna "double/ghost" text insert ke baad bhi rahega.
-        page.apply_redactions(
-            images=fitz.PDF_REDACT_IMAGE_REMOVE,
-            text=fitz.PDF_REDACT_TEXT_REMOVE,
-        )
-
-        # 2) Insert (text ko bbox ke andar tight rakhein)
-        for edit in edits:
-            text = (edit.text or "").strip()
-            if not text:
-                continue
-                
-            rect = _padded_rect(edit, "text")
-            text_rect = rect  # use same rect for decorations so lines align with inserted text
-            font_name = _map_font_for_fitz(edit.font)
-            font_size = float(edit.size or 11)
-            try:
-                _insert_textbox_fit(page, rect, text, font_name, font_size, edit.color, edit.align)
-            except Exception as e:
-                _insert_textbox_fit(page, rect, text, "helv", font_size, edit.color, edit.align)
-                
-            # Render box-level text decorations (keep lines tight to actual text)
-            if edit.is_underline or edit.is_strike:
-                # Color parsing
-                ch = edit.color.lstrip("#")
-                if len(ch) == 6:
-                    line_color = tuple(int(ch[i:i+2], 16) / 255.0 for i in (0, 2, 4))
-                else:
-                    line_color = (0.0, 0.0, 0.0)
-
-                # Use the text insertion rect so underline width matches new text
-                orig = text_rect
-                font_sz = float(edit.size or 11)
-                font_name = _map_font_for_fitz(edit.font)
-                text_content = (edit.text or "").rstrip("\n")
-
-                line_height = font_sz * 1.05
-                line_w = max(0.8, font_sz * 0.06)
-
-                # Draw per-line to avoid spilling outside text bounds
-                lines = text_content.splitlines() or [""]
-                for idx, line in enumerate(lines):
-                    # Compute line width using font metrics
-                    try:
-                        line_width = fitz.get_text_length(line, fontname=font_name, fontsize=font_sz)
-                    except Exception:
-                        line_width = min(orig.width, font_sz * max(1, len(line)) * 0.55)
-
-                    # Align start based on text alignment
-                    if edit.align == "right":
-                        lx0 = orig.x1 - line_width
-                    elif edit.align == "center":
-                        lx0 = orig.x0 + max(0, (orig.width - line_width) / 2)
-                    else:
-                        lx0 = orig.x0
-                    lx1 = lx0 + line_width
-
-                    # Vertical positions
-                    baseline_y = orig.y0 + (idx + 1) * line_height
-
-                    if edit.is_underline:
-                        y_pos = baseline_y + 1.0
-                        page.draw_line(
-                            fitz.Point(lx0, y_pos),
-                            fitz.Point(lx1, y_pos),
-                            color=line_color,
-                            width=line_w,
-                        )
-
-                    if edit.is_strike:
-                        y_pos = baseline_y - (font_sz * 0.45)
-                        page.draw_line(
-                            fitz.Point(lx0, y_pos),
-                            fitz.Point(lx1, y_pos),
-                            color=line_color,
-                            width=line_w,
-                        )
-
-    out_path = output_path(payload.file_id)
-    doc.save(out_path)
-    doc.close()
-
-    # Generate preview images immediately after saving
+    doc: fitz.Document | None = None
     try:
-        preview_doc = fitz_open_workspace_pdf(out_path)
-        for pg_num in range(1, preview_doc.page_count + 1):
-            pg = preview_doc[pg_num - 1]
-            pix = pg.get_pixmap(matrix=fitz.Matrix(4, 4), alpha=False)
-            img_path = preview_edited_path(payload.file_id, pg_num)
-            pix.save(img_path)
+        try:
+            doc = fitz.open(path)
+        except Exception:
+            raise HTTPException(
+                status_code=401,
+                detail="PDF is password-protected. Unlock it first.",
+            ) from None
+        if doc.is_encrypted:
+            raise HTTPException(
+                status_code=401,
+                detail="PDF is password-protected. Unlock it first.",
+            )
+
+        meta_backup = dict(doc.metadata)
+
+        by_page: dict[int, list[EditItem]] = defaultdict(list)
+        for item in normalized_edits:
+            by_page[item.page - 1].append(item)
+
+        for page_index, edits in by_page.items():
+            if page_index < 0 or page_index >= doc.page_count:
+                continue
+            page = doc[page_index]
+
+            insert_left_unify = _unify_paragraph_left_x0_for_insert(edits)
+
+            def _edit_for_insert_text(e: EditItem) -> EditItem:
+                mx = insert_left_unify.get(e.id)
+                if mx is None:
+                    return e
+                b = list(e.bbox)
+                x0_o, _, x1_o, _ = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                min_w = _min_insert_width_pt(e)
+                max_x0 = x1_o - min_w
+                if max_x0 <= x0_o + 1e-3:
+                    return e
+                tx = min(float(mx), max_x0)
+                if tx <= x0_o + 1e-6:
+                    return e
+                b[0] = tx
+                return e.model_copy(update={"bbox": b})
+
+            def _padded_rect(edit_item: EditItem, mode: str) -> fitz.Rect:
+                """
+                Text boxes ka bbox extracted tight hota hai.
+                Double text/cut se bachne ke liye redaction rect ko text insert rect se
+                thoda bada rakhte hain.
+                """
+                if mode == "redact" and edit_item.original_bbox:
+                    raw = fitz.Rect(edit_item.original_bbox)
+                else:
+                    raw = fitz.Rect(edit_item.bbox)
+                    if mode == "text" and edit_item.original_bbox:
+                        try:
+                            ob = edit_item.original_bbox
+                            if len(ob) == 4:
+                                o = fitz.Rect([float(v) for v in ob])
+                                r = raw
+                                # Save path recomputes bbox from DOM; tiny drift used to break the old
+                                # "both edges within 2.5pt" rule → insert used shifted x0 (first word jumped left).
+                                tol = 8.0
+                                x0 = o.x0 if abs(r.x0 - o.x0) <= tol else r.x0
+                                x1 = o.x1 if abs(r.x1 - o.x1) <= tol else r.x1
+                                if x1 > x0 + 0.5:
+                                    raw = fitz.Rect(x0, r.y0, x1, r.y1)
+                        except Exception:
+                            pass
+
+                base = float(edit_item.size or 11)
+                w = max(0.1, float(raw.x1 - raw.x0))
+                h = max(0.1, float(raw.y1 - raw.y0))
+
+                txt = (edit_item.text or "").strip()
+                lines = [ln for ln in txt.splitlines() if ln.strip() != ""]
+                line_count = max(1, len(lines))
+                max_line = max(lines, key=len) if lines else txt
+
+                if mode == "redact":
+                    pad_x = max(0.6, base * 0.15, w * 0.06)
+                    pad_y = max(0.6, base * 0.20, h * 0.08)
+                    est_char_w = base * 0.55
+                    est_line_h = base * 1.05
+                    cap_x = 10.0
+                    cap_y = 10.0
+                    mult_x = 0.22
+                    mult_y = 0.18
+                else:
+                    pad_x = max(0.4, base * 0.10, w * 0.04)
+                    pad_y = max(0.4, base * 0.14, h * 0.06)
+                    est_char_w = base * 0.50
+                    est_line_h = base * 1.02
+                    cap_x = 7.0
+                    cap_y = 7.0
+                    mult_x = 0.18
+                    mult_y = 0.14
+
+                est_text_w = len(max_line) * est_char_w
+                est_text_h = line_count * est_line_h
+
+                extra_x = max(0.0, (est_text_w - w) / 2.0)
+                extra_y = max(0.0, (est_text_h - h) / 2.0)
+
+                pad_x = min(pad_x + extra_x * mult_x, cap_x)
+                pad_y = min(pad_y + extra_y * mult_y, cap_y)
+
+                if mode == "text":
+                    return fitz.Rect(raw.x0, raw.y0 - pad_y, raw.x1 + pad_x, raw.y1 + pad_y)
+                return fitz.Rect(raw.x0 - pad_x, raw.y0 - pad_y, raw.x1 + pad_x, raw.y1 + pad_y)
+
+            valid_ops: list[tuple[EditItem, fitz.Rect, fitz.Rect | None]] = []
+            for edit in edits:
+                rr = _clip_rect_to_page(page, _padded_rect(edit, "redact"))
+                if rr is None:
+                    continue
+                text = (edit.text or "").strip()
+                ir: fitz.Rect | None = None
+                if text:
+                    ins_e = _edit_for_insert_text(edit)
+                    ir = _clip_rect_to_page(page, _padded_rect(ins_e, "text"))
+                    if ir is None:
+                        continue
+                valid_ops.append((edit, rr, ir))
+
+            for _edit, rr, _ir in valid_ops:
+                fill_rgb = _sample_background_fill_rgb(page, rr)
+                page.add_redact_annot(rr, fill=fill_rgb)
+
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_PIXELS,
+                text=fitz.PDF_REDACT_TEXT_REMOVE,
+            )
+
+            for edit, _rr, ir in valid_ops:
+                text = (edit.text or "").strip()
+                if not text or ir is None:
+                    continue
+
+                rect = ir
+                text_rect = rect
+                font_name = _map_font_for_fitz(edit.font)
+                font_size = float(edit.size or 11)
+                safe_color = (edit.color or "#000000").strip() or "#000000"
+                _insert_textbox_fit_try_font_chain(
+                    page, rect, text, font_name, font_size, safe_color, edit.align
+                )
+
+                if edit.is_underline or edit.is_strike:
+                    ch = safe_color.lstrip("#")
+                    if len(ch) == 6:
+                        line_color = tuple(int(ch[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+                    else:
+                        line_color = (0.0, 0.0, 0.0)
+
+                    orig = text_rect
+                    font_sz = float(edit.size or 11)
+                    font_name = _map_font_for_fitz(edit.font)
+                    text_content = (edit.text or "").rstrip("\n")
+
+                    line_height = font_sz * 1.05
+                    line_w = max(0.8, font_sz * 0.06)
+
+                    lines = text_content.splitlines() or [""]
+                    for idx, line in enumerate(lines):
+                        try:
+                            line_width = fitz.get_text_length(
+                                line, fontname=font_name, fontsize=font_sz
+                            )
+                        except Exception:
+                            line_width = min(orig.width, font_sz * max(1, len(line)) * 0.55)
+
+                        if edit.align == "right":
+                            lx0 = orig.x1 - line_width
+                        elif edit.align == "center":
+                            lx0 = orig.x0 + max(0, (orig.width - line_width) / 2)
+                        else:
+                            lx0 = orig.x0
+                        lx1 = lx0 + line_width
+
+                        baseline_y = orig.y0 + (idx + 1) * line_height
+
+                        if edit.is_underline:
+                            y_pos = baseline_y + 1.0
+                            page.draw_line(
+                                fitz.Point(lx0, y_pos),
+                                fitz.Point(lx1, y_pos),
+                                color=line_color,
+                                width=line_w,
+                            )
+
+                        if edit.is_strike:
+                            y_pos = baseline_y - (font_sz * 0.45)
+                            page.draw_line(
+                                fitz.Point(lx0, y_pos),
+                                fitz.Point(lx1, y_pos),
+                                color=line_color,
+                                width=line_w,
+                            )
+
+        out_path = output_path(payload.file_id)
+        try:
+            doc.set_metadata(meta_backup)
+        except Exception:
+            pass
+        ensure_output_path(payload.file_id)
+        doc.save(out_path)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Save failed: {e!s}") from e
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    try:
+        preview_doc = fitz_open_workspace_pdf(output_path(payload.file_id))
+        _write_workspace_page_previews(payload.file_id, preview_doc)
         preview_doc.close()
     except Exception:
-        pass  # Preview generation failure should not block the response
+        pass
 
     return {"download_url": f"/download/{payload.file_id}"}
 

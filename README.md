@@ -1,4 +1,4 @@
-﻿# PDF Editor Tool
+# PDF Editor Tool
 
 Simple local tool for editing text blocks inside PDF files.
 
@@ -13,17 +13,27 @@ Simple local tool for editing text blocks inside PDF files.
 - Frontend: HTML + CSS + JavaScript
 
 ## Run
-1. Create virtual environment:
-   python -m venv .venv
-2. Activate:
-   .venv\Scripts\activate
-3. Install deps:
-   pip install -r requirements.txt
-4. Start app:
-   uvicorn app:app --reload --port 8080
-5. Open:
-   http://127.0.0.1:8080
+Preferred local startup with the bundled virtual environment:
+
+1. Activate the virtual environment:
+   `.venv\Scripts\activate`
+2. Install or refresh dependencies:
+   `python -m pip install -r requirements.txt`
+3. Start the app:
+   `python run_server.py`
+4. Open:
+   `http://127.0.0.1:8000`
+
+Alternative direct command:
+
+`python -m uvicorn app:app --host 127.0.0.1 --port 8000`
+
+Windows helper launchers already included:
+- `run-server.cmd`
+- `run-server.ps1`
+- `start-pdf-editor.bat`
 
 ## Notes
+- The app listens on port `8000`.
 - Best results for digitally-generated PDFs (not scanned images).
 - For scanned PDFs, OCR integration is needed (next step).

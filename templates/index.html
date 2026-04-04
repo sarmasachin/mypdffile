@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Adobe Scan Clone</title>
+  <title>PDF Editor Tool</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -63,7 +63,7 @@
       <div class="editor-header-right">
         <button class="icon-btn" id="undoBtn" aria-label="Undo"><i class="fa-solid fa-rotate-left"></i></button>
         <button class="icon-btn" id="redoBtn" aria-label="Redo"><i class="fa-solid fa-rotate-right"></i></button>
-        <button class="icon-btn" id="saveBtn" aria-label="Save Edits"><i class="fa-solid fa-check" style="color: #0070d6; font-size: 24px;"></i></button>
+        <button class="icon-btn" id="saveBtn" aria-label="Save"><i class="fa-solid fa-check" style="color: #0070d6; font-size: 24px;"></i></button>
       </div>
     </header>
     
@@ -86,7 +86,7 @@
     <!-- Screen 2: Bottom Toolbar -->
     <div class="editor-bottom-wrap">
       <div class="promo-banner editor-promo">
-        <div class="promo-text">Save edits and explore more tools</div>
+        <div class="promo-text">Save and explore more tools</div>
         <button class="promo-btn" style="background: #fff; color: #0070d6; border: none;">Free trial</button>
       </div>
       
@@ -94,7 +94,7 @@
       <div class="editor-toolbar">
          <button class="icon-btn" id="addTextBtnBottom" aria-label="Add Text" style="position:relative;"><i class="fa-solid fa-plus" style="font-size: 11px; position:absolute; top:10px; left:8px; font-weight:900;"></i><i class="fa-solid fa-t" style="font-size: 20px;"></i></button>
          <div class="toolbar-separator"></div>
-         <button class="icon-btn" id="formatBoldBtn" style="font-weight:bold; font-size: 20px;">T</button>
+         <button type="button" class="icon-btn" id="formatBoldBtn" style="font-weight:bold; font-size: 20px;" title="Poora text block bold hoga — textarea mein sirf selected hissa alag bold nahi ho sakta. Save par bold PDF mein dikhega.">T</button>
          <button class="icon-btn" id="formatItalicBtn" style="font-style:italic; font-family: serif; font-size: 20px;">T</button>
          <button class="icon-btn" id="formatUnderlineBtn" style="text-decoration:underline; font-size: 20px;">T</button>
          <button class="icon-btn" id="formatStrikeBtn" style="position:relative; font-size: 20px;">T<div style="position:absolute; width:12px; height:1.5px; background:#555; top:50%; left:50%; transform:translate(-50%,-50%);"></div></button>
@@ -292,6 +292,10 @@
                 <div class="more-option-icon"><i class="fa-solid fa-crop-simple"></i></div>
                 <span class="more-option-text">Crop page</span>
             </button>
+            <button class="more-option-btn" id="imageOcrTextEditBtn">
+                <div class="more-option-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></div>
+                <span class="more-option-text">Image OCR text edit</span>
+            </button>
             <button class="more-option-btn" id="signatureStampBtn">
                 <div class="more-option-icon"><i class="fa-solid fa-signature"></i></div>
                 <span class="more-option-text">Signature / stamp (auto background)</span>
@@ -441,7 +445,7 @@
     <header class="top-app-bar" style="background: #fff; border-bottom: 1px solid #ddd; flex-shrink: 0;">
       <div class="editor-header-left">
         <button class="icon-btn" id="back-to-edit-btn" aria-label="Back"><i class="fa-solid fa-arrow-left"></i></button>
-        <span class="editor-title">Preview</span>
+        <span class="editor-title">Document</span>
       </div>
       <div class="editor-header-right">
         <button class="icon-btn" id="final-download-btn" aria-label="Download" style="color: #0070d6;"><i class="fa-solid fa-cloud-arrow-down"></i></button>
@@ -457,6 +461,30 @@
     </div>
   </div>
 
+  <!-- After upload: preview + actions (does not auto-open editor) -->
+  <div id="upload-result-view" class="view">
+    <header class="top-app-bar" style="background: #fff; border-bottom: 1px solid #ddd; flex-shrink: 0;">
+      <div class="editor-header-left">
+        <button type="button" class="icon-btn" id="upload-result-back-btn" aria-label="Back"><i class="fa-solid fa-arrow-left"></i></button>
+        <span class="editor-title" id="upload-result-title">Document</span>
+      </div>
+    </header>
+    <div class="editor-workspace preview-scroll-area" id="upload-result-preview-container">
+    </div>
+    <div class="editor-bottom-wrap upload-result-actions-wrap">
+      <div class="upload-result-actions">
+        <div class="upload-result-row">
+          <button type="button" class="action-row-btn" id="upload-result-edit-btn" aria-label="Edit text"><i class="fa-solid fa-pen-to-square"></i> <span>Edit text</span></button>
+          <button type="button" class="action-row-btn" id="upload-result-preview-btn" aria-label="Preview"><i class="fa-regular fa-eye"></i> <span>Preview</span></button>
+          <button type="button" class="action-row-btn" id="upload-result-download-btn" aria-label="Download"><i class="fa-solid fa-cloud-arrow-down"></i> <span>Download</span></button>
+        </div>
+        <div class="upload-result-row">
+          <button type="button" class="action-row-btn" id="upload-result-share-btn" aria-label="Share"><i class="fa-solid fa-share-nodes"></i> <span>Share</span></button>
+          <button type="button" class="action-row-btn" id="upload-result-more-btn" aria-label="More Options"><i class="fa-solid fa-ellipsis-vertical"></i> <span>More</span></button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- Combine View -->
   <div id="combineView" class="view">
@@ -558,5 +586,7 @@
   </div>
 
   <script src="{{ request.url_for('static', path='app.js') }}"></script>
+  <link rel="stylesheet" href="{{ request.url_for('static', path='image-ocr-more-tool.css') }}">
+  <script src="{{ request.url_for('static', path='image-ocr-more-tool.js') }}"></script>
 </body>
 </html>
