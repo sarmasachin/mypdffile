@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from api.image_edit_tool import create_image_edit_router, cleanup_ocr_items_for_editor
+from api.image_edit_tool import cleanup_ocr_items_for_editor
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -43,7 +43,6 @@ app = FastAPI(title="PDF Editor Tool")
 # Behind Render / other reverse proxies so request.url_for / schemes stay correct.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-app.include_router(create_image_edit_router(WORK_DIR))
 
 
 class EditItem(BaseModel):
