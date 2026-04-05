@@ -179,7 +179,8 @@ body {
   resize: none;
   overflow: hidden;
   box-sizing: border-box;
-  padding: 0;
+  /* Slight inset so glyphs are not flush against the blue frame (box-sizing keeps 100% size). */
+  padding: 2px 2px;
   margin: 0;
   outline: none;
   display: block;
@@ -191,6 +192,16 @@ body {
 .pdf-box-wrapper.active .pdf-text-input,
 .pdf-box-wrapper.edited .pdf-text-input {
   color: #333;
+}
+
+/*
+ * Only the active-edit textarea (# set in syncPdfActiveEditInputId).
+ * Top padding 0 so the line sits higher in the blue box; small bottom padding for descenders (y,g,p).
+ * No line-height override — keeps app.js fontSize/lineHeight(px) as-is (previous !important was skewing layout).
+ */
+#pdf-active-edit-input {
+  box-sizing: border-box;
+  padding: 0 2px 5px 2px;
 }
 
 /* Resize Handles */

@@ -1194,17 +1194,12 @@ def _extract_items_from_text_dict(page_index: int, text_dict: dict[str, Any]) ->
                 first_span = chunk[0]
                 font_name = first_span.get("font", "helv") or "helv"
                 size = float(first_span.get("size", 11.0))
-                # Span "flags" mark synthetic bold/italic even when the font name omits "Bold"/"Italic".
-                any_bold = any(
-                    int(s.get("flags", 0)) & int(fitz.TEXT_FONT_BOLD) for s in chunk
-                )
+                # Do not append "-bold" from TEXT_FONT_BOLD: many PDFs set the flag loosely and replaced
+                # text then drew too heavy vs the page. Rely on the span's font name for bold.
                 any_italic = any(
                     int(s.get("flags", 0)) & int(fitz.TEXT_FONT_ITALIC) for s in chunk
                 )
                 fl = font_name.lower()
-                if any_bold and "bold" not in fl:
-                    font_name = f"{font_name}-bold"
-                    fl = font_name.lower()
                 if any_italic and "italic" not in fl and "oblique" not in fl:
                     font_name = f"{font_name}-italic"
 

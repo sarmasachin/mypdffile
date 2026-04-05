@@ -23,6 +23,38 @@ let shareContextFile = null;
 /** True while the formatting toolbar is being used — blur handlers must not steal focus. */
 let isFormatting = false;
 
+/**
+ * PDF text overlay (blue box): typography tuned only here so save/bbox math stays consistent.
+ * 1.1 was too tight — ascenders/descenders looked clipped inside the wrapper.
+ */
+const PDF_OVERLAY_LINE_HEIGHT = 1.25;
+const PDF_OVERLAY_MIN_BOX_HT_EM = 1.34;
+/** Horizontal slack beyond PDF bbox (pt → px); keeps long lines slightly less cramped. */
+const PDF_OVERLAY_WIDTH_EXTRA_PX = 12;
+/** Extra px after canvas measureText so real glyphs are not clipped vs canvas metrics. */
+const PDF_OVERLAY_WIDTH_MEASURE_PAD_PX = 8;
+
+/** Min pixel width for one logical line (canvas + padding); used to grow the box to the right while typing. */
+function pdfOverlayUnwrappedContentWidthPx(area) {
+  try {
+    const st = getComputedStyle(area);
+    const ctx = document.createElement("canvas").getContext("2d");
+    if (!ctx) return 0;
+    ctx.font = st.font || "16px sans-serif";
+    const padL = parseFloat(st.paddingLeft) || 0;
+    const padR = parseFloat(st.paddingRight) || 0;
+    let max = 0;
+    const lines = area.value.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const lineW = ctx.measureText(lines[i] || " ").width;
+      if (lineW > max) max = lineW;
+    }
+    return Math.ceil(max + padL + padR + PDF_OVERLAY_WIDTH_MEASURE_PAD_PX);
+  } catch (_) {
+    return 0;
+  }
+}
+
 function sanitizePdfFilename(name) {
   if (!name || typeof name !== "string") return "document.pdf";
   let s = name.trim().replace(/[/\\?%*:|"<>]/g, "_").replace(/\s+/g, " ");
@@ -591,31 +623,98 @@ function centerEditableBoxInEditor(boxWrapper) {
   }
 }
 
+const PDF_EDIT_ZOOM_SCALE = 1.6;
+
+function getPdfStageScale(stage) {
+  if (!stage) return 1;
+  const inline = (stage.style.transform || "").trim();
+  const m = inline.match(/scale\(([^)]+)\)/);
+  if (m) {
+    const v = parseFloat(m[1]);
+    if (!Number.isNaN(v)) return v;
+  }
+  const cs = getComputedStyle(stage).transform;
+  if (cs && cs !== "none") {
+    const mm = cs.match(/matrix\(([^)]+)\)/);
+    if (mm) {
+      const a = parseFloat(mm[1].split(/[,\s]+/)[0]);
+      if (!Number.isNaN(a)) return a;
+    }
+  }
+  return 1;
+}
+
+function isPdfStageZoomed(stage) {
+  return getPdfStageScale(stage) > 1.01;
+}
+
+function resetPdfEditZoomStage(stage) {
+  if (!stage) return;
+  stage.style.removeProperty("transition");
+  stage.style.transform = "scale(1)";
+  stage.style.width = "100%";
+  stage.style.height = "auto";
+  const pw = stage.closest(".page-wrapper");
+  if (pw) {
+    pw.style.width = "100%";
+    pw.style.height = "auto";
+    pw.style.zIndex = "1";
+  }
+}
+
+function resetAllPdfEditZoom() {
+  if (!pageEditor) return;
+  pageEditor.querySelectorAll(".page-stage").forEach(resetPdfEditZoomStage);
+}
+
+function resetOtherPdfEditZoomStages(exceptStage) {
+  if (!pageEditor) return;
+  pageEditor.querySelectorAll(".page-stage").forEach((s) => {
+    if (s !== exceptStage) resetPdfEditZoomStage(s);
+  });
+}
+
+let _applyZoomLastBox = null;
+let _applyZoomLastAt = 0;
+const APPLY_ZOOM_DEDUPE_MS = 120;
+
 function applyZoomToBoxContext(boxWrapper) {
   if (!boxWrapper) return;
+  const t = performance.now();
+  if (_applyZoomLastBox === boxWrapper && t - _applyZoomLastAt < APPLY_ZOOM_DEDUPE_MS) {
+    return;
+  }
+  _applyZoomLastBox = boxWrapper;
+  _applyZoomLastAt = t;
+
   const pageWrapper = boxWrapper.closest(".page-wrapper");
   const stage = pageWrapper ? pageWrapper.querySelector(".page-stage") : null;
   if (!pageWrapper || !stage) return;
 
-  // Capture base unscaled dimensions and lockdown physics
+  /* Avoid "double zoom": CSS transition animated scale(1)→scale(1.6) as two steps. Measure with transitions off, then one animated jump to 1.6. */
+  stage.style.transition = "none";
   stage.style.transform = "scale(1)";
+  void stage.offsetWidth;
+
   const unscaledW = stage.offsetWidth;
   const unscaledH = stage.offsetHeight;
 
-  // Lock stage dimensions so it doesn't implicitly stretch when parent is inflated
   stage.style.width = `${unscaledW}px`;
   stage.style.height = `${unscaledH}px`;
 
-  // Physical visual zoom locked strictly to top-left to avoid negative clipping
   stage.style.transformOrigin = "0 0";
-  stage.style.transform = "scale(1.6)";
+  stage.style.transform = "scale(1)";
   pageWrapper.style.zIndex = "50";
+  pageWrapper.style.width = `${unscaledW * PDF_EDIT_ZOOM_SCALE}px`;
+  pageWrapper.style.height = `${unscaledH * PDF_EDIT_ZOOM_SCALE}px`;
 
-  // Inflate the container size directly to unlock absolute native scroll routing limits
-  pageWrapper.style.width = `${unscaledW * 1.6}px`;
-  pageWrapper.style.height = `${unscaledH * 1.6}px`;
+  requestAnimationFrame(() => {
+    stage.style.removeProperty("transition");
+    requestAnimationFrame(() => {
+      stage.style.transform = `scale(${PDF_EDIT_ZOOM_SCALE})`;
+    });
+  });
 
-  // .page-stage animates transform ~300ms — center after zoom settles, then once more after layout
   const centerAfterZoom = () => centerEditableBoxInEditor(boxWrapper);
   setTimeout(() => {
     centerAfterZoom();
@@ -623,7 +722,32 @@ function applyZoomToBoxContext(boxWrapper) {
       centerAfterZoom();
       setTimeout(centerAfterZoom, 50);
     });
-  }, 350);
+  }, 320);
+}
+
+/**
+ * First focus on a page runs zoom; further focuses while that page stays zoomed only scroll-center the box.
+ * Focusing a box on another page resets zoom on all other pages, then zooms that page if needed.
+ */
+function focusPdfEditBoxZoomOrCenter(boxWrapper) {
+  if (!boxWrapper) return;
+  const pageWrapper = boxWrapper.closest(".page-wrapper");
+  const stage = pageWrapper ? pageWrapper.querySelector(".page-stage") : null;
+  if (!pageWrapper || !stage) return;
+
+  resetOtherPdfEditZoomStages(stage);
+
+  if (isPdfStageZoomed(stage)) {
+    const runCenter = () => centerEditableBoxInEditor(boxWrapper);
+    runCenter();
+    requestAnimationFrame(() => {
+      runCenter();
+      setTimeout(runCenter, 50);
+    });
+    return;
+  }
+
+  applyZoomToBoxContext(boxWrapper);
 }
 
 function updatePdfBlockFloatMenuPosition() {
@@ -675,6 +799,16 @@ function getFloatMenuTargetArea() {
   return pdfFloatMenuTargetBox.querySelector(".pdf-text-input");
 }
 
+/** Assign id for CSS only on the one `.active` edit textarea — see `#pdf-active-edit-input` in styles.css */
+const PDF_ACTIVE_EDIT_INPUT_ID = "pdf-active-edit-input";
+
+function syncPdfActiveEditInputId() {
+  const prev = document.getElementById(PDF_ACTIVE_EDIT_INPUT_ID);
+  if (prev) prev.removeAttribute("id");
+  const ta = document.querySelector(".pdf-box-wrapper.active .pdf-text-input");
+  if (ta) ta.id = PDF_ACTIVE_EDIT_INPUT_ID;
+}
+
 function syncFormattingToolbarFromArea(area) {
   const boldBtn = document.getElementById("formatBoldBtn");
   const italicBtn = document.getElementById("formatItalicBtn");
@@ -701,6 +835,7 @@ function enterPdfBlockEditMode(boxWrapper) {
   lastActiveArea = area;
   syncFormattingToolbarFromArea(area);
   area.focus();
+  syncPdfActiveEditInputId();
 }
 
 function wirePdfBlockFloatMenuOnce() {
@@ -2031,7 +2166,7 @@ async function renderEditor(pages, items) {
       area.dataset.size = String(item.size || 11);
 
       area.style.fontFamily = mapFont(item.font);
-      area.style.lineHeight = "1.1";
+      area.style.lineHeight = String(PDF_OVERLAY_LINE_HEIGHT);
 
       boxWrapper.appendChild(area);
 
@@ -2152,7 +2287,8 @@ async function renderEditor(pages, items) {
         boxWrapper.classList.add('active');
         area.removeAttribute('readonly');
         syncFormattingToolbarFromArea(area);
-        applyZoomToBoxContext(boxWrapper);
+        focusPdfEditBoxZoomOrCenter(boxWrapper);
+        syncPdfActiveEditInputId();
       });
       
       area.addEventListener("blur", (e) => {
@@ -2164,16 +2300,9 @@ async function renderEditor(pages, items) {
         setTimeout(() => {
            if(document.activeElement !== area) {
                boxWrapper.classList.remove('active');
+               syncPdfActiveEditInputId();
            }
-        }, 150); 
-        
-        // Revert physical zoom state fully
-        stage.style.transform = `scale(1)`;
-        stage.style.width = "100%";
-        stage.style.height = "auto";
-        pageWrapper.style.width = "100%";
-        pageWrapper.style.height = "auto";
-        pageWrapper.style.zIndex = "1";
+        }, 150);
       });
 
       overlay.appendChild(boxWrapper);
@@ -2203,14 +2332,14 @@ async function renderEditor(pages, items) {
         const sr = stage.getBoundingClientRect();
         return (sr.height / sc) / page.height;
       }
-      
+
       for (const obj of boxWrappers) {
         const area = obj.area;
         const box = obj.box;
         
         const sz = Number(area.dataset.size || 11);
         let fontPx = sz * pxPerPoint;
-        const linePx = fontPx * 1.1;
+        const linePx = fontPx * PDF_OVERLAY_LINE_HEIGHT;
         area.style.fontSize = `${fontPx}px`;
         area.style.lineHeight = `${linePx}px`;
 
@@ -2221,13 +2350,20 @@ async function renderEditor(pages, items) {
         
         const leftPx = x0 * pxPerPoint;
         const topPx = y0 * pxPerPoint;
-        const baseWidthPx = (x1 - x0) * pxPerPoint + 10;
-        const baseHeightPx = Math.max((y1 - y0) * pxPerPoint, fontPx * 1.2);
+        const baseWidthPx = (x1 - x0) * pxPerPoint + PDF_OVERLAY_WIDTH_EXTRA_PX;
+        const baseHeightPx = Math.max(
+          (y1 - y0) * pxPerPoint,
+          fontPx * PDF_OVERLAY_MIN_BOX_HT_EM
+        );
 
         box.style.left = `${leftPx}px`;
         box.style.top = `${topPx}px`;
         box.style.width = `${baseWidthPx}px`;
         box.style.height = `${baseHeightPx}px`;
+
+        let prevScrollH = area.scrollHeight;
+        let prevNewlineCount = (area.value.match(/\n/g) || []).length;
+        let prevValueLen = area.value.length;
 
         area.addEventListener("input", () => {
            // Toggle edited state class for white background (hiding original PDF text behind it)
@@ -2237,14 +2373,69 @@ async function renderEditor(pages, items) {
                box.classList.remove('edited');
            }
 
-           const currentH = parseFloat(box.style.height);
-           if (area.scrollHeight > currentH) {
-               box.style.height = `${area.scrollHeight}px`;
-               const ppp = pxPerPointLive();
-               const ptY1 = Number(area.dataset.y0) + (area.scrollHeight / ppp);
-               area.dataset.bbox = JSON.stringify([Number(area.dataset.x0), Number(area.dataset.y0), Number(area.dataset.x1), ptY1]);
-               area.dataset.y1 = ptY1;
+           const stageMaxW = Math.max(baseWidthPx, stage.clientWidth - leftPx - 4);
+           const needW = pdfOverlayUnwrappedContentWidthPx(area);
+           const targetW = Math.min(Math.max(baseWidthPx, needW), stageMaxW);
+           const widthCapped = needW > stageMaxW - 0.5;
+           const currentW = parseFloat(box.style.width);
+           if (Math.abs(targetW - currentW) > 0.5) {
+             box.style.width = `${targetW}px`;
+             const pppW = pxPerPointLive();
+             const innerW = Math.max(0.1, targetW - PDF_OVERLAY_WIDTH_EXTRA_PX);
+             const newX1 = Number(area.dataset.x0) + innerW / pppW;
+             area.dataset.x1 = String(newX1);
+             area.dataset.bbox = JSON.stringify([
+               Number(area.dataset.x0),
+               Number(area.dataset.y0),
+               newX1,
+               Number(area.dataset.y1),
+             ]);
+             void area.offsetHeight;
            }
+
+           const currentH = parseFloat(box.style.height);
+           const scrollH = area.scrollHeight;
+           const linePxNum = parseFloat(area.style.lineHeight) || linePx;
+           const nlc = (area.value.match(/\n/g) || []).length;
+           const vlen = area.value.length;
+           const enterAdded = nlc > prevNewlineCount;
+           const wrapGain = scrollH - prevScrollH >= linePxNum * 0.65;
+           const lineRemoved = nlc < prevNewlineCount;
+           const textShortened = vlen < prevValueLen;
+
+           let targetH = currentH;
+           if (scrollH > currentH && (enterAdded || (wrapGain && widthCapped))) {
+             targetH = scrollH;
+           } else if (scrollH < currentH || lineRemoved || textShortened) {
+             /* Tall box + height:100% textarea: scrollHeight often stays ~box height, so shrink never ran. Collapse to min height, read true content scrollHeight, restore. */
+             const savedH = box.style.height;
+             box.style.height = `${baseHeightPx}px`;
+             void area.offsetHeight;
+             const measured = area.scrollHeight;
+             box.style.height = savedH;
+             void area.offsetHeight;
+             targetH = Math.max(baseHeightPx, measured);
+           }
+
+           if (Math.abs(targetH - currentH) > 0.5) {
+             box.style.height = `${targetH}px`;
+             const ppp = pxPerPointLive();
+             const ptY1 = Number(area.dataset.y0) + (targetH / ppp);
+             area.dataset.y1 = String(ptY1);
+             area.dataset.bbox = JSON.stringify([
+               Number(area.dataset.x0),
+               Number(area.dataset.y0),
+               Number(area.dataset.x1),
+               ptY1,
+             ]);
+           }
+
+           /* Programmatic width/height + overflow:hidden leaves stale scrollLeft; start of line looks "gone". */
+           area.scrollLeft = 0;
+
+           prevScrollH = area.scrollHeight;
+           prevNewlineCount = nlc;
+           prevValueLen = vlen;
         });
       }
     });
@@ -2257,6 +2448,8 @@ async function renderEditor(pages, items) {
             });
             document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => a.removeAttribute('readonly'));
             hidePdfBlockFloatMenu();
+            syncPdfActiveEditInputId();
+            resetAllPdfEditZoom();
         }
     });
     stage.addEventListener('touchstart', (e) => {
@@ -2267,6 +2460,8 @@ async function renderEditor(pages, items) {
             });
             document.querySelectorAll('.overlay .pdf-text-input').forEach((a) => a.removeAttribute('readonly'));
             hidePdfBlockFloatMenu();
+            syncPdfActiveEditInputId();
+            resetAllPdfEditZoom();
         }
     }, {passive: true});
   }
@@ -2327,7 +2522,7 @@ async function renderEditor(pages, items) {
     area.dataset.align = "left";
     area.style.color = "#000000";
     area.style.fontFamily = 'sans-serif';
-    area.style.lineHeight = "1.1";
+    area.style.lineHeight = String(PDF_OVERLAY_LINE_HEIGHT);
 
     boxWrapper.appendChild(area);
 
@@ -2434,7 +2629,8 @@ async function renderEditor(pages, items) {
       boxWrapper.classList.add('active');
       area.removeAttribute('readonly');
       syncFormattingToolbarFromArea(area);
-      applyZoomToBoxContext(boxWrapper);
+      focusPdfEditBoxZoomOrCenter(boxWrapper);
+      syncPdfActiveEditInputId();
     });
     
     area.addEventListener("blur", (e) => {
@@ -2446,19 +2642,13 @@ async function renderEditor(pages, items) {
       setTimeout(() => {
          if(document.activeElement !== area) {
              boxWrapper.classList.remove('active');
+             syncPdfActiveEditInputId();
          }
-      }, 150); 
-      
-      stage.style.transform = `scale(1)`;
-      stage.style.width = "100%";
-      stage.style.height = "auto";
-      const pageWrapper = stage.closest('.page-wrapper');
-      pageWrapper.style.width = "100%";
-      pageWrapper.style.height = "auto";
-      pageWrapper.style.zIndex = "1";
+      }, 150);
     });
 
     firstOverlay.appendChild(boxWrapper);
+    syncPdfActiveEditInputId();
     
     // Register for saving
     textAreas.push(area);
@@ -2503,7 +2693,7 @@ async function renderEditor(pages, items) {
       const currentPx = parseFloat(lastActiveArea.style.fontSize) || 11;
       const ratio = newSize / currentSize;
       lastActiveArea.style.fontSize = `${currentPx * ratio}px`;
-      lastActiveArea.style.lineHeight = `${(currentPx * ratio) * 1.1}px`;
+      lastActiveArea.style.lineHeight = `${(currentPx * ratio) * PDF_OVERLAY_LINE_HEIGHT}px`;
   });
 
   document.getElementById("formatBoldBtn")?.addEventListener("click", () => {
@@ -2605,6 +2795,8 @@ async function renderEditor(pages, items) {
       w.classList.remove("active");
     });
     document.querySelectorAll(".pdf-text-input").forEach((a) => a.removeAttribute("readonly"));
+    syncPdfActiveEditInputId();
+    resetAllPdfEditZoom();
     editorView.classList.remove("active");
     homeView.classList.add("active");
   });
@@ -2629,6 +2821,7 @@ function normalizeEditorLayoutForSave() {
   });
   document.querySelectorAll(".pdf-text-input").forEach((a) => a.removeAttribute("readonly"));
   hidePdfBlockFloatMenu();
+  syncPdfActiveEditInputId();
   const ae = document.activeElement;
   if (ae && ae.classList && ae.classList.contains("pdf-text-input")) {
     ae.blur();
@@ -2669,6 +2862,34 @@ function syncBboxesFromDOMToPdfPoints() {
   });
 }
 
+function isTextareaVisuallyBold(area) {
+  const w = String(area.style.fontWeight || "").toLowerCase();
+  if (w === "bold" || w === "bolder") return true;
+  let n = parseInt(w, 10);
+  if (!Number.isNaN(n) && n >= 600) return true;
+  try {
+    const cw = String(getComputedStyle(area).fontWeight || "").toLowerCase();
+    if (cw === "bold" || cw === "bolder") return true;
+    n = parseInt(cw, 10);
+    if (!Number.isNaN(n) && n >= 600) return true;
+  } catch (_) {}
+  return false;
+}
+
+/** PDF save: bold face only when the textarea is actually bold; else strip "bold" from font names. */
+function fontPayloadForPdfSave(area) {
+  const raw = (area.dataset.font || "helv").trim() || "helv";
+  if (isTextareaVisuallyBold(area)) {
+    return raw;
+  }
+  if (!raw.toLowerCase().includes("bold")) {
+    return raw;
+  }
+  let f = raw.replace(/bold/gi, "");
+  f = f.replace(/[-_]{2,}/g, (m) => m[0]).replace(/^[-_]+|[-_]+$/g, "");
+  return f || "helv";
+}
+
 // Save changes to backend
 saveBtn.addEventListener("click", async () => {
   if (!currentFileId) return;
@@ -2695,7 +2916,7 @@ saveBtn.addEventListener("click", async () => {
       page: Number(area.dataset.page),
       bbox: JSON.parse(area.dataset.bbox || "[]"),
       original_bbox: JSON.parse(area.dataset.originalBbox || area.dataset.bbox || "[]"),
-      font: area.dataset.font || "helv",
+      font: fontPayloadForPdfSave(area),
       size: parseFloat(area.dataset.size || 11.0),
       color: area.dataset.color || "#000000",
       align: area.dataset.align || "left",
