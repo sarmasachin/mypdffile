@@ -1,0 +1,14 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Dashboard में Web Service बनाते समय भी यही values manually set कर सकते हो।
+
+services:
+  - type: web
+    name: mypdffile
+    runtime: python
+    region: oregon # जरूरत हो तो बदलो
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    # जरूरी: Render बाहर से traffic के लिए 0.0.0.0 और env $PORT use करता है।
+    # run_server.py या python run_server.py बिना env के मत चलाओ — default 127.0.0.1 deploy तोड़ देता है।
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /

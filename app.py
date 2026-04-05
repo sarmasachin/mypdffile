@@ -23,6 +23,8 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "work"
+# Fallback TTF when OS has no DejaVu/Arial (e.g. minimal Render image) — fixes '?' glyphs on save.
+_FONT_TTF_CACHE = BASE_DIR / ".fontcache_pdfedit"
 WORK_DIR.mkdir(exist_ok=True)
 STAMP_DIR = WORK_DIR / "stamps"
 STAMP_DIR.mkdir(exist_ok=True)
@@ -475,6 +477,63 @@ def _add_watermark(page: fitz.Page, text: str, opacity: float, font_size: float,
     )
 
 
+def _bundled_noto_ttf_path(bold: bool) -> str | None:
+    key = "notosbo" if bold else "notos"
+    try:
+        import pymupdf_fonts
+    except ImportError:
+        return None
+    try:
+        _FONT_TTF_CACHE.mkdir(exist_ok=True)
+        path = _FONT_TTF_CACHE / f"{key}.ttf"
+        data = pymupdf_fonts.myfont(key)
+        if not path.is_file() or path.stat().st_size != len(data):
+            path.write_bytes(data)
+        return str(path)
+    except Exception:
+        return None
+
+
+def _system_sans_ttf_for_insert(mapped_font: str) -> tuple[str | None, str]:
+    """
+    Prefer a real TTF for every text replacement: Base-14 Helvetica uses WinAnsi and
+    often renders PDF-extracted Unicode (thin spaces, rupee, smart quotes) as '?'.
+    Returns (path_or_None, pdf_font_resource_name).
+    """
+    windir = (os.environ.get("WINDIR") or "").strip()
+    bold = "bold" in (mapped_font or "").lower()
+    if bold:
+        order: list[str] = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+        if windir:
+            order.append(os.path.join(windir, "Fonts", "arialbd.ttf"))
+        order.append("C:\\Windows\\Fonts\\arialbd.ttf")
+        name = "pdfeditbd"
+    else:
+        order = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]
+        if windir:
+            order.extend(
+                [
+                    os.path.join(windir, "Fonts", "arial.ttf"),
+                    os.path.join(windir, "Fonts", "segoeui.ttf"),
+                ]
+            )
+        order.extend(["C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\segoeui.ttf"])
+        name = "pdfeditrm"
+    for p in order:
+        if p and os.path.isfile(p):
+            return p, name
+    bundled = _bundled_noto_ttf_path(bold)
+    if bundled:
+        return bundled, "pdfnotosbo" if bold else "pdfnotos"
+    return None, name
+
+
 def _insert_textbox_fit(
     page: fitz.Page,
     rect: fitz.Rect,
@@ -483,6 +542,8 @@ def _insert_textbox_fit(
     start_size: float,
     color_hex: str = "#000000",
     align: str = "left",
+    *,
+    clip_rect: fitz.Rect | None = None,
 ) -> None:
     # Parse hex color safely
     color_hex = color_hex.lstrip("#")
@@ -500,16 +561,95 @@ def _insert_textbox_fit(
 
     # Do not extend x1: +400 made the layout box almost full-line wide so wrapped lines broke
     # at wrong places vs the table column (preview looked "left" / jagged vs Description header).
-    expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y1 + 400)
+    max_y1 = float(rect.y1) + 400.0
+    if clip_rect is not None and float(clip_rect.y1) >= float(rect.y0) + 0.5:
+        # Keep inserted text inside the redacted (cleared) band; +400 pt below was drawing on top of
+        # untouched PDF content and looked like a bad text overlay in the downloaded file.
+        max_y1 = min(max_y1, float(clip_rect.y1))
+    max_y1 = max(max_y1, float(rect.y0) + 1.0)
+    expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, max_y1) & page.rect
 
-    page.insert_textbox(
-        expanded_rect,
-        text,
-        fontsize=float(start_size),
-        fontname=font_name,
-        color=(r, g, b),
-        align=align_code,
-    )
+    t = text or ""
+    avail_h = max(1.0, float(expanded_rect.height))
+    avail_w = max(1.0, float(expanded_rect.width))
+    multiline = ("\n" in t) or len(t) > 120
+    design_mul = 1.42 if multiline else 1.32
+
+    fs_cap = max(5.0, float(start_size))
+    if clip_rect is not None:
+        fs_cap = min(fs_cap, max(5.0, avail_h / 1.05))
+
+    def _estimated_line_count(fs_try: float) -> int:
+        if not t.strip():
+            return 1
+        parts = t.split("\n")
+        n_explicit = sum(1 for p in parts if p.strip() != "")
+        n_explicit = max(1, n_explicit)
+        longest = max(parts, key=len)
+        try:
+            tw = fitz.get_text_length(longest, fontname=font_name, fontsize=fs_try)
+        except Exception:
+            tw = len(longest) * fs_try * 0.52
+        wraps = max(
+            0,
+            int(math.ceil(tw / max(avail_w, fs_try * 2.5))) - 1,
+        )
+        return max(1, n_explicit + wraps)
+
+    def _lineheight_for(fs_try: float) -> float:
+        n_ln = _estimated_line_count(fs_try)
+        design_h = fs_try * design_mul
+        cap_h = (avail_h * 0.91) / float(n_ln)
+        return min(design_h, max(fs_try * 1.03, cap_h))
+
+    ff, embed_name = _system_sans_ttf_for_insert(font_name)
+
+    def _paint(fs_try: float, lineheight: float | None) -> bool:
+        extra: dict[str, Any] = {}
+        if lineheight is not None:
+            extra["lineheight"] = lineheight
+        if ff:
+            try:
+                rc = page.insert_textbox(
+                    expanded_rect,
+                    t,
+                    fontsize=fs_try,
+                    fontname=embed_name,
+                    fontfile=ff,
+                    color=(r, g, b),
+                    align=align_code,
+                    **extra,
+                )
+                if rc >= 0:
+                    return True
+            except Exception:
+                pass
+        try:
+            rc = page.insert_textbox(
+                expanded_rect,
+                t,
+                fontsize=fs_try,
+                fontname=font_name,
+                color=(r, g, b),
+                align=align_code,
+                **extra,
+            )
+            return rc >= 0
+        except Exception:
+            return False
+
+    fs = fs_cap
+    for _ in range(14):
+        if fs < 4.9:
+            break
+        lh = _lineheight_for(fs)
+        if _paint(fs, lh):
+            return
+        if _paint(fs, None):
+            return
+        fs *= 0.88
+
+    _paint(5.0, None)
 
 
 # PyMuPDF short names sometimes fail on specific PDFs; try PDF standard names before dropping bold.
@@ -542,6 +682,8 @@ def _insert_textbox_fit_try_font_chain(
     start_size: float,
     color_hex: str,
     align: str,
+    *,
+    clip_rect: fitz.Rect | None = None,
 ) -> None:
     seen: set[str] = set()
     chain = [mapped_font] + _FITZ_FONT_FALLBACKS.get(mapped_font, [])
@@ -552,7 +694,9 @@ def _insert_textbox_fit_try_font_chain(
             continue
         seen.add(fn)
         try:
-            _insert_textbox_fit(page, rect, text, fn, start_size, color_hex, align)
+            _insert_textbox_fit(
+                page, rect, text, fn, start_size, color_hex, align, clip_rect=clip_rect
+            )
             return
         except Exception as e:
             last_err = e
@@ -812,21 +956,26 @@ async def reorder_pages(req: dict = {"file_id": "", "page_indices": []}) -> dict
         raise HTTPException(status_code=500, detail=f"Reorder failed: {str(e)}")
 
 
+def _safe_upload_basename(name: str | None) -> str:
+    fn = (name or "upload.bin").strip() or "upload.bin"
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", fn)[:180]
+
+
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)) -> dict[str, Any]:
     file_id = str(uuid.uuid4())
     folder = WORK_DIR / file_id
     folder.mkdir(parents=True, exist_ok=True)
     destination = folder / "input.pdf"
-    
-    temp_path = folder / f"temp_{file.filename}"
+    safe_fn = _safe_upload_basename(file.filename)
+    temp_path = folder / f"temp_{uuid.uuid4()}_{safe_fn}"
     with temp_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
     is_encrypted = False
     try:
         # Check if it's already a PDF
-        if file.filename.lower().endswith(".pdf"):
+        if safe_fn.lower().endswith(".pdf"):
             shutil.move(str(temp_path), str(destination))
             doc = fitz_open_workspace_pdf(destination)
             is_encrypted = doc.is_encrypted
@@ -851,7 +1000,7 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict[str, Any]:
         if temp_path.exists(): os.remove(temp_path)
         raise HTTPException(status_code=400, detail=f"Unsupported file format: {str(e)}")
 
-    return {"file_id": file_id, "filename": file.filename, "needs_password": is_encrypted}
+    return {"file_id": file_id, "filename": safe_fn, "needs_password": is_encrypted}
 
 
 @app.post("/unlock")
@@ -1484,7 +1633,14 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
                 font_size = _insert_font_size_for_rect(edit, ir)
                 safe_color = (edit.color or "#000000").strip() or "#000000"
                 _insert_textbox_fit_try_font_chain(
-                    page, rect, text, font_name, font_size, safe_color, edit.align
+                    page,
+                    rect,
+                    text,
+                    font_name,
+                    font_size,
+                    safe_color,
+                    edit.align,
+                    clip_rect=_rr,
                 )
 
                 if edit.is_underline or edit.is_strike:
@@ -1873,6 +2029,9 @@ async def compress_pdf(req: dict = {"file_id": "", "quality": 60}) -> dict[str, 
 
 @app.post("/upload_multiple")
 async def upload_multiple(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded. Choose a PDF or image (JPG/PNG).")
+
     file_id = str(uuid.uuid4())
     folder = WORK_DIR / file_id
     folder.mkdir(parents=True, exist_ok=True)
@@ -1880,35 +2039,68 @@ async def upload_multiple(files: list[UploadFile] = File(...)) -> dict[str, Any]
     
     doc = fitz.open()
     
-    for file in files:
-        temp_img = folder / f"temp_{uuid.uuid4()}_{file.filename}"
-        with temp_img.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        try:
-            # Check if it's an image
-            img_doc = fitz_open_workspace_pdf(temp_img)
-            pdf_bytes = img_doc.convert_to_pdf()
-            img_doc.close()
-            
-            img_page = fitz.open("pdf", pdf_bytes)
-            doc.insert_pdf(img_page)
-            img_page.close()
-        except Exception:
-            # If it's already a PDF, just insert it
-            if file.filename.lower().endswith(".pdf"):
-                pdf_doc = fitz_open_workspace_pdf(temp_img)
-                doc.insert_pdf(pdf_doc)
-                pdf_doc.close()
-        
-        # Cleanup temp image
-        if temp_img.exists():
-            os.remove(temp_img)
-            
-    doc.save(destination)
-    doc.close()
-    
-    return {"file_id": file_id, "filename": "Combined.pdf", "needs_password": False}
+    try:
+        for file in files:
+            safe_fn = _safe_upload_basename(file.filename)
+            temp_img = folder / f"temp_{uuid.uuid4()}_{safe_fn}"
+            with temp_img.open("wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            inserted = False
+            try:
+                img_doc = fitz_open_workspace_pdf(temp_img)
+                pdf_bytes = img_doc.convert_to_pdf()
+                img_doc.close()
+
+                img_page = fitz.open("pdf", pdf_bytes)
+                doc.insert_pdf(img_page)
+                img_page.close()
+                inserted = True
+            except Exception:
+                pass
+
+            if not inserted and safe_fn.lower().endswith(".pdf"):
+                try:
+                    pdf_doc = fitz_open_workspace_pdf(temp_img)
+                    doc.insert_pdf(pdf_doc)
+                    pdf_doc.close()
+                    inserted = True
+                except Exception as e:
+                    if temp_img.exists():
+                        os.remove(temp_img)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f'Could not read PDF "{safe_fn}": {e!s}',
+                    ) from e
+
+            if temp_img.exists():
+                os.remove(temp_img)
+
+            if not inserted:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f'Unsupported file "{safe_fn}". Use PDF, JPG, or PNG (HEIC/WebP may not work).',
+                )
+
+        doc.save(str(destination), garbage=4, deflate=True)
+    finally:
+        _safe_fitz_close(doc)
+
+    chk = fitz.open(destination)
+    try:
+        n_pages = chk.page_count
+        needs_pw = bool(chk.is_encrypted)
+    finally:
+        chk.close()
+
+    if n_pages < 1:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise HTTPException(
+            status_code=400,
+            detail="No pages could be created from the upload. Try another PDF or image.",
+        )
+
+    return {"file_id": file_id, "filename": "Combined.pdf", "needs_password": needs_pw}
 
 
 @app.post("/split_pages")

@@ -10,6 +10,7 @@ build/
 
 # App runtime / uploads (do not commit user PDFs)
 work/
+.fontcache_pdfedit/
 
 # Logs
 *.log
