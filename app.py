@@ -64,6 +64,7 @@ class EditItem(BaseModel):
 class EditRequest(BaseModel):
     file_id: str
     edits: list[EditItem]
+    save_as_copy: bool = False
 
 
 class PasswordRequest(BaseModel):
@@ -1423,7 +1424,17 @@ def _unify_paragraph_left_x0_for_insert(edits: list[EditItem]) -> dict[str, floa
 @app.post("/edit")
 async def edit_pdf(payload: EditRequest) -> dict[str, str]:
     # Client bboxes are always in input.pdf space (matches /analyze). Rebuild edited.pdf from input each save.
-    path = ensure_file(payload.file_id)
+    source_file_id = payload.file_id
+    target_file_id = source_file_id
+    if payload.save_as_copy:
+        ensure_file(source_file_id)
+        new_id = str(uuid.uuid4())
+        new_dir = WORK_DIR / new_id
+        new_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(input_path(source_file_id), input_path(new_id))
+        target_file_id = new_id
+
+    path = ensure_file(target_file_id)
 
     normalized_edits = [
         item
@@ -1434,14 +1445,17 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
     ]
 
     if not normalized_edits:
-        shutil.copy(path, ensure_output_path(payload.file_id))
+        shutil.copy(path, ensure_output_path(target_file_id))
         try:
-            preview_doc = fitz_open_workspace_pdf(ensure_output_path(payload.file_id))
-            _write_workspace_page_previews(payload.file_id, preview_doc)
+            preview_doc = fitz_open_workspace_pdf(ensure_output_path(target_file_id))
+            _write_workspace_page_previews(target_file_id, preview_doc)
             preview_doc.close()
         except Exception:
             pass
-        return {"download_url": f"/download/{payload.file_id}"}
+        return {
+            "download_url": f"/download/{target_file_id}",
+            "file_id": target_file_id,
+        }
 
     doc: fitz.Document | None = None
     try:
@@ -1690,12 +1704,12 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
                                 width=line_w,
                             )
 
-        out_path = output_path(payload.file_id)
+        out_path = output_path(target_file_id)
         try:
             doc.set_metadata(meta_backup)
         except Exception:
             pass
-        ensure_output_path(payload.file_id)
+        ensure_output_path(target_file_id)
         doc.save(out_path)
 
     except HTTPException:
@@ -1710,13 +1724,16 @@ async def edit_pdf(payload: EditRequest) -> dict[str, str]:
                 pass
 
     try:
-        preview_doc = fitz_open_workspace_pdf(output_path(payload.file_id))
-        _write_workspace_page_previews(payload.file_id, preview_doc)
+        preview_doc = fitz_open_workspace_pdf(output_path(target_file_id))
+        _write_workspace_page_previews(target_file_id, preview_doc)
         preview_doc.close()
     except Exception:
         pass
 
-    return {"download_url": f"/download/{payload.file_id}"}
+    return {
+        "download_url": f"/download/{target_file_id}",
+        "file_id": target_file_id,
+    }
 
 
 @app.post("/set_password")

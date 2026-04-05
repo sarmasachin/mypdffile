@@ -625,3 +625,171 @@ body {
 #stampBox .crop-handle {
   z-index: 2;
 }
+
+/* Stamp placement only: crop-workspace used dark #2a2a2a — looked like black bars on all sides; use white like the PDF page. */
+#stampView .crop-workspace {
+  background: #fff;
+  padding: 12px 16px 24px;
+}
+#stampView .crop-hint {
+  display: none;
+}
+
+/* Save destination modal (edit → save choice) — compact */
+.save-dest-overlay {
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.48);
+  z-index: 10003;
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+.save-dest-dialog {
+  width: 100%;
+  max-width: 300px;
+  margin: 0 16px;
+  padding: 16px 16px 12px;
+  background: #fff;
+  border-radius: 14px;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.16), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  text-align: left;
+  animation: alertPop 0.28s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+.save-dest-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.save-dest-icon-wrap {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: linear-gradient(145deg, #e8f2fc 0%, #d4e8fa 100%);
+  color: #0070d6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.save-dest-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  color: #1a1a1a;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.save-dest-body {
+  margin: 0 0 12px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: #5c5c5c;
+}
+.save-dest-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.save-dest-btn {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 11px;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+  transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.save-dest-btn:active {
+  transform: scale(0.98);
+}
+.save-dest-btn--primary {
+  background: linear-gradient(180deg, #0d7fe0 0%, #0070d6 100%);
+  color: #fff;
+  box-shadow: 0 3px 10px rgba(0, 112, 214, 0.3);
+}
+.save-dest-btn--primary:active {
+  box-shadow: 0 2px 6px rgba(0, 112, 214, 0.28);
+}
+.save-dest-btn--primary .save-dest-btn-icon {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+.save-dest-btn--secondary {
+  background: #f5f8fc;
+  color: #1a3a52;
+  border: 1.5px solid #c8ddf0;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.save-dest-btn--secondary:active {
+  background: #eef4fa;
+}
+.save-dest-btn--secondary .save-dest-btn-icon {
+  background: #e3f0fc;
+  color: #0070d6;
+}
+.save-dest-btn-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 14px;
+}
+.save-dest-btn-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.save-dest-btn-label {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.save-dest-btn-hint {
+  font-size: 10.5px;
+  font-weight: 400;
+  line-height: 1.3;
+  opacity: 0.88;
+}
+.save-dest-btn--primary .save-dest-btn-hint {
+  color: rgba(255, 255, 255, 0.9);
+}
+.save-dest-btn--secondary .save-dest-btn-hint {
+  color: #4a6578;
+}
+.save-dest-btn--ghost {
+  margin-top: 6px;
+  padding: 6px 10px;
+  min-height: 40px;
+  justify-content: center;
+  background: transparent;
+  color: #666;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 8px;
+}
+.save-dest-btn--ghost:active {
+  background: #f3f3f3;
+}
+@media (max-width: 380px) {
+  .save-dest-dialog {
+    max-width: min(300px, calc(100vw - 28px));
+    margin: 0 14px;
+    padding: 14px 14px 10px;
+  }
+}

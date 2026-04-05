@@ -581,6 +581,36 @@
     </div>
   </div>
 
+  <!-- Save destination: English (this file vs new copy) -->
+  <div id="saveDestinationOverlay" class="save-dest-overlay share-overlay hidden">
+    <div class="save-dest-dialog" role="dialog" aria-labelledby="saveDestTitle" aria-modal="true">
+      <div class="save-dest-header">
+        <div class="save-dest-icon-wrap" aria-hidden="true">
+          <i class="fa-solid fa-floppy-disk"></i>
+        </div>
+        <h3 id="saveDestTitle" class="save-dest-title">Save changes</h3>
+      </div>
+      <p class="save-dest-body">Overwrite this file or save a new copy.</p>
+      <div class="save-dest-actions">
+        <button type="button" id="saveDestInPlace" class="save-dest-btn save-dest-btn--primary">
+          <span class="save-dest-btn-icon"><i class="fa-solid fa-file-pen"></i></span>
+          <span class="save-dest-btn-text">
+            <span class="save-dest-btn-label">Save to this file</span>
+            <span class="save-dest-btn-hint">Replace PDF in list</span>
+          </span>
+        </button>
+        <button type="button" id="saveDestCopy" class="save-dest-btn save-dest-btn--secondary">
+          <span class="save-dest-btn-icon"><i class="fa-regular fa-copy"></i></span>
+          <span class="save-dest-btn-text">
+            <span class="save-dest-btn-label">Save as a new copy</span>
+            <span class="save-dest-btn-hint">Original stays unchanged</span>
+          </span>
+        </button>
+      </div>
+      <button type="button" id="saveDestCancel" class="save-dest-btn save-dest-btn--ghost">Cancel</button>
+    </div>
+  </div>
+
   <script src="{{ request.url_for('static', path='app.js') }}"></script>
 </body>
 </html>

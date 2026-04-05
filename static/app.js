@@ -1243,6 +1243,47 @@ customConfirmCancel.onclick = () => {
     onConfirmOk = null;
 };
 
+const saveDestinationOverlay = document.getElementById("saveDestinationOverlay");
+
+/** @returns {Promise<'cancel'|'in_place'|'copy'>} */
+function showSaveDestinationChoice() {
+  return new Promise((resolve) => {
+    if (!saveDestinationOverlay) {
+      resolve("in_place");
+      return;
+    }
+    const finish = (v) => {
+      saveDestinationOverlay.classList.add("hidden");
+      resolve(v);
+    };
+    const btnIn = document.getElementById("saveDestInPlace");
+    const btnCopy = document.getElementById("saveDestCopy");
+    const btnCancel = document.getElementById("saveDestCancel");
+    const onIn = () => {
+      btnIn?.removeEventListener("click", onIn);
+      btnCopy?.removeEventListener("click", onCopy);
+      btnCancel?.removeEventListener("click", onCancel);
+      finish("in_place");
+    };
+    const onCopy = () => {
+      btnIn?.removeEventListener("click", onIn);
+      btnCopy?.removeEventListener("click", onCopy);
+      btnCancel?.removeEventListener("click", onCancel);
+      finish("copy");
+    };
+    const onCancel = () => {
+      btnIn?.removeEventListener("click", onIn);
+      btnCopy?.removeEventListener("click", onCopy);
+      btnCancel?.removeEventListener("click", onCancel);
+      finish("cancel");
+    };
+    btnIn?.addEventListener("click", onIn);
+    btnCopy?.addEventListener("click", onCopy);
+    btnCancel?.addEventListener("click", onCancel);
+    saveDestinationOverlay.classList.remove("hidden");
+  });
+}
+
 // Compress PDF Global Logic (Updated for Custom Alert & Confirm)
 document.getElementById("compressPdfBtn")?.addEventListener('click', async () => {
     if (!selectedMoreFile || !selectedMoreFile.fileObj.id) {
@@ -2894,6 +2935,10 @@ function fontPayloadForPdfSave(area) {
 saveBtn.addEventListener("click", async () => {
   if (!currentFileId) return;
 
+  const saveChoice = await showSaveDestinationChoice();
+  if (saveChoice === "cancel") return;
+  const saveAsCopy = saveChoice === "copy";
+
   normalizeEditorLayoutForSave();
   await new Promise((resolve) =>
     requestAnimationFrame(() => requestAnimationFrame(resolve))
@@ -2931,7 +2976,11 @@ saveBtn.addEventListener("click", async () => {
     const res = await fetch("/edit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file_id: currentFileId, edits }),
+      body: JSON.stringify({
+        file_id: currentFileId,
+        edits,
+        save_as_copy: saveAsCopy,
+      }),
     });
 
     if (!res.ok) {
@@ -2939,8 +2988,28 @@ saveBtn.addEventListener("click", async () => {
       throw new Error(err.detail || "Server failed to save edits.");
     }
 
-    const { download_url } = await res.json();
-    
+    const result = await res.json();
+    const download_url = result.download_url;
+    const previewFileId = result.file_id || currentFileId;
+
+    if (
+      saveAsCopy &&
+      result.file_id &&
+      result.file_id !== currentFileId
+    ) {
+      const orig = mockFiles.find((f) => f.id === currentFileId);
+      const baseTitle = orig?.title || "document.pdf";
+      mockFiles.unshift({
+        id: result.file_id,
+        title: `Copy — ${baseTitle}`,
+        size: orig?.size,
+        date: new Date().toISOString(),
+        thumb: `/preview_edited/${result.file_id}/1?v=${Date.now()}`,
+      });
+      persistRecentFiles();
+      renderMockFiles();
+    }
+
     // Setup and show preview view instead of downloading immediately
     const previewView = document.getElementById("preview-view");
     const previewContainer = document.getElementById("preview-container");
@@ -2949,7 +3018,7 @@ saveBtn.addEventListener("click", async () => {
     previewContainer.innerHTML = "";
     pagesMeta.forEach(p => {
         const img = document.createElement("img");
-        img.src = `/preview_edited/${currentFileId}/${p.page}?_t=${Date.now()}`;
+        img.src = `/preview_edited/${previewFileId}/${p.page}?_t=${Date.now()}`;
         img.style.width = "100%";
         img.style.marginBottom = "16px";
         img.style.boxShadow = "0 2px 6px rgba(0,0,0,0.15)";
@@ -2969,7 +3038,7 @@ saveBtn.addEventListener("click", async () => {
       
       newBtn.addEventListener("click", () => {
         const link = document.createElement("a");
-        const fname = getDownloadFilenameForFileId(currentFileId);
+        const fname = getDownloadFilenameForFileId(previewFileId);
         link.href = `${download_url}?filename=${encodeURIComponent(fname)}`;
         link.download = fname;
         document.body.appendChild(link);
